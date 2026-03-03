@@ -777,7 +777,7 @@ private:
 
     void reset_alter_status_counters();
 
-    std::string get_facet_str_val(const std::string& field_name, uint32_t facet_id);
+    std::string get_facet_str_val(const std::string& field_name, uint32_t facet_id) const;
 
     Option<bool> fix_broken_reference(const std::string& seq_id_key, const uint32_t& seq_id,
                                       const tsl::htrie_set<char>& include_fields_full,
@@ -1286,7 +1286,7 @@ public:
 
     bool check_store_alter_status_msg(bool success, const std::string& msg = "");
 
-    std::string get_facet_str_val_with_lock(const std::string& field_name, uint32_t facet_id);
+    std::string get_facet_str_val_with_lock(const std::string& field_name, uint32_t facet_id) const;
 
     Option<bool> include_related_docs(nlohmann::json& doc, const uint32_t& seq_id,
                                       const reference_info_t& ref_info,

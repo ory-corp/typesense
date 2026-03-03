@@ -9192,11 +9192,11 @@ void Collection::reset_alter_status_counters() {
     altered_docs = 0;
 }
 
-std::string Collection::get_facet_str_val(const std::string& field_name, uint32_t facet_id) {
+std::string Collection::get_facet_str_val(const std::string& field_name, uint32_t facet_id) const {
     return index->get_facet_str_val(field_name, facet_id);
 }
 
-std::string Collection::get_facet_str_val_with_lock(const std::string& field_name, uint32_t facet_id) {
+std::string Collection::get_facet_str_val_with_lock(const std::string& field_name, uint32_t facet_id) const {
     std::shared_lock lock(mutex);
     return get_facet_str_val(field_name, facet_id);
 }
@@ -9326,7 +9326,8 @@ Option<bool> Collection::populate_facets(std::vector<facet> facets, size_t max_f
                 auto facet_range_iter = a_facet.facet_range_map.find(kv.first);
                 if(facet_range_iter != a_facet.facet_range_map.end()){
                     auto & facet_count = kv.second;
-                    facet_value_t facet_value = {facet_range_iter->second.range_label, std::string(), facet_count.count};
+                    facet_value_t facet_value = {facet_range_iter->second.range_label, std::string(),
+                                                 facet_count.count, 0, nlohmann::json(), std::string()};
 
                     if(!a_facet.reference_collection_name.empty()) {
                         const auto& ref_coll_name = a_facet.reference_collection_alias_name.empty() ?
@@ -9478,7 +9479,7 @@ Option<bool> Collection::populate_facets(std::vector<facet> facets, size_t max_f
 
                 const auto& highlighted_text = highlight.snippets.empty() ? value : highlight.snippets[0];
                 facet_value_t facet_value = {value, highlighted_text, facet_count.count,
-                                             facet_count.sort_field_val, parent};
+                                             facet_count.sort_field_val, parent, std::string()};
 
                 if(!a_facet.reference_collection_name.empty()) {
                     const auto& ref_coll_name = a_facet.reference_collection_alias_name.empty() ?
