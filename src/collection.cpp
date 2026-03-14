@@ -2919,7 +2919,8 @@ Option<nlohmann::json> Collection::search(std::string query, const std::vector<s
                                           const std::vector<std::string>& search_synonym_sets,
                                           float diversity_lamda,
                                           size_t group_max_candidates,
-                                          size_t diversity_limit) {
+                                          size_t diversity_limit,
+                                          const float facet_min_occurrence_ratio) {
     auto args = collection_search_args_t(query, search_fields, filter_query,
                                          facet_fields, sort_fields,
                                          num_typos, per_page, page, token_order,
@@ -2937,7 +2938,8 @@ Option<nlohmann::json> Collection::search(std::string query, const std::vector<s
                                          max_extra_prefix, max_extra_suffix, facet_query_num_typos,
                                          filter_curated_hits_option, prioritize_token_position, vector_query_str,
                                          enable_highlight_v1, search_time_start_us, match_type,
-                                         facet_sample_percent, facet_sample_threshold, facet_sample_slope, page_offset,
+                                         facet_sample_percent, facet_sample_threshold, facet_sample_slope,
+                                         facet_min_occurrence_ratio, page_offset,
                                          facet_index_type, remote_embedding_timeout_ms, remote_embedding_num_tries,
                                          stopwords_set, facet_return_parent,
                                          ref_include_exclude_fields_vec,
@@ -3408,7 +3410,9 @@ Option<nlohmann::json> Collection::search(collection_search_args_t& coll_args) {
     populate_facets(search_params->facets, coll_args.max_facet_values, coll_args.facet_return_parent,
                     search_params->facet_query, coll_args.highlight_affix_num_tokens,
                     coll_args.snippet_threshold,
-                    coll_args.highlight_start_tag, coll_args.highlight_end_tag, raw_query, result["facet_counts"]);
+                    coll_args.highlight_start_tag, coll_args.highlight_end_tag, raw_query,
+                    result["facet_counts"]);
+    filter_dynamic_facets_by_occurrence(result["facet_counts"], total, coll_args.facet_min_occurrence_ratio);
 
     result["search_cutoff"] = search_cutoff;
 
@@ -4086,6 +4090,8 @@ Option<bool> Collection::do_union(const std::vector<uint32_t>& collection_ids,
     }
 
     merge_facet_results(result);
+    filter_dynamic_facets_by_occurrence(result["facet_counts"], total,
+                                        searches.empty() ? 0.0f : searches[0].facet_min_occurrence_ratio);
 
     for (auto& request: request_json_list) {
         result["union_request_params"] += std::move(request);
@@ -7792,6 +7798,7 @@ Option<bool> Collection::parse_facet(const std::string& facet_field, std::vector
         } else if (facet_field[i] == '*') {
             if (i == facet_field.size() - 1) {
                 auto prefix = facet_field.substr(0, facet_field.size() - 1);
+                const bool is_dynamic_facet = prefix.empty();
                 auto pair = search_schema.equal_prefix_range(prefix);
 
                 if (pair.first == pair.second) {
@@ -7805,6 +7812,7 @@ Option<bool> Collection::parse_facet(const std::string& facet_field, std::vector
                     if (field->facet) {
                         facets.emplace_back(facet(field->name, facets.size()));
                         facets.back().is_wildcard_match = true;
+                        facets.back().is_dynamic = is_dynamic_facet;
                     }
                 }
                 i++;
@@ -8877,6 +8885,7 @@ Option<bool> collection_search_args_t::init(std::map<std::string, std::string>& 
     size_t facet_sample_percent = 100;
     size_t facet_sample_threshold = 0;
     size_t facet_sample_slope = 0;
+    float facet_min_occurrence_ratio = 0.5f;
 
     bool conversation = false;
     std::string conversation_id;
@@ -8996,7 +9005,8 @@ Option<bool> collection_search_args_t::init(std::map<std::string, std::string>& 
     };
 
     std::unordered_map<std::string, float*> float_values = {
-            {DIVERSITY_LAMBDA, &diversity_lamda}
+            {DIVERSITY_LAMBDA, &diversity_lamda},
+            {FACET_MIN_OCCURRENCE_RATIO, &facet_min_occurrence_ratio}
     };
 
     for(const auto& kv: req_params) {
@@ -9158,6 +9168,10 @@ Option<bool> collection_search_args_t::init(std::map<std::string, std::string>& 
         diversity_lamda = diversity_t::DEFAULT_LAMDA_VALUE;
     }
 
+    if (facet_min_occurrence_ratio < 0.0f || facet_min_occurrence_ratio > 1.0f) {
+        return Option<bool>(400, "Parameter `" + std::string(FACET_MIN_OCCURRENCE_RATIO) + "` must be between 0.0 and 1.0.");
+    }
+
     args = collection_search_args_t(raw_query, search_fields, filter_query,
                                     facet_fields, sort_fields,
                                     num_typos, per_page, page, token_order,
@@ -9175,7 +9189,8 @@ Option<bool> collection_search_args_t::init(std::map<std::string, std::string>& 
                                     max_extra_prefix, max_extra_suffix, facet_query_num_typos,
                                     filter_curated_hits_option, prioritize_token_position, vector_query,
                                     enable_highlight_v1, start_ts, match_type,
-                                    facet_sample_percent, facet_sample_threshold, facet_sample_slope, offset,
+                                    facet_sample_percent, facet_sample_threshold, facet_sample_slope,
+                                    facet_min_occurrence_ratio, offset,
                                     facet_strategy, remote_embedding_timeout_ms, remote_embedding_num_tries,
                                     stopwords_set, facet_return_parent,
                                     ref_include_exclude_fields_vec,
@@ -9560,6 +9575,8 @@ Option<bool> Collection::populate_facets(std::vector<facet> facets, size_t max_f
 
         facet_result["stats"]["total_values"] = facet_counts.size();
 
+        facet_result["is_dynamic"] = a_facet.is_dynamic;
+
         if(is_union) {
             facet_result["is_sortby_alpha"] = a_facet.is_sort_by_alpha;
             facet_result["sort_order"] = a_facet.sort_order;
@@ -9586,6 +9603,11 @@ Option<bool> Collection::merge_facet_results(nlohmann::json& result) {
                     field_to_facet_counts[field_name]["sampled"] = facet_count["sampled"];
                     field_to_facet_counts[field_name]["is_sortby_alpha"] = facet_count["is_sortby_alpha"];
                     field_to_facet_counts[field_name]["sort_order"] = facet_count["sort_order"];
+                    field_to_facet_counts[field_name]["is_dynamic"] = facet_count.value("is_dynamic", false);
+                } else {
+                    field_to_facet_counts[field_name]["is_dynamic"] =
+                        field_to_facet_counts[field_name]["is_dynamic"].get<bool>() &&
+                        facet_count.value("is_dynamic", false);
                 }
 
                 field_to_facet_counts[field_name]["counts"].push_back(count);
@@ -9649,6 +9671,49 @@ Option<bool> Collection::merge_facet_results(nlohmann::json& result) {
             }
         }
     }
+    return Option<bool>(true);
+}
+
+Option<bool> Collection::filter_dynamic_facets_by_occurrence(nlohmann::json& facet_counts, size_t found_docs,
+                                                             float facet_min_occurrence_ratio) {
+    if (!facet_counts.is_array()) {
+        return Option<bool>(true);
+    }
+
+    nlohmann::json filtered_facet_counts = nlohmann::json::array();
+
+    for (auto& facet_count : facet_counts) {
+        const bool is_dynamic = facet_count.value("is_dynamic", false);
+        if (!is_dynamic) {
+            facet_count.erase("is_dynamic");
+            filtered_facet_counts.push_back(facet_count);
+            continue;
+        }
+
+        if (facet_min_occurrence_ratio <= 0.0f || found_docs == 0) {
+            facet_count.erase("is_dynamic");
+            filtered_facet_counts.push_back(facet_count);
+            continue;
+        }
+
+        nlohmann::json filtered_counts = nlohmann::json::array();
+        for (const auto& count : facet_count["counts"]) {
+            const auto occurrence_ratio =
+                static_cast<float>(count["count"].get<size_t>()) / static_cast<float>(found_docs);
+            if (occurrence_ratio >= facet_min_occurrence_ratio) {
+                filtered_counts.push_back(count);
+            }
+        }
+
+        if (!filtered_counts.empty()) {
+            facet_count["counts"] = std::move(filtered_counts);
+            facet_count["stats"]["total_values"] = facet_count["counts"].size();
+            facet_count.erase("is_dynamic");
+            filtered_facet_counts.push_back(facet_count);
+        }
+    }
+
+    facet_counts = std::move(filtered_facet_counts);
     return Option<bool>(true);
 }
 
