@@ -1225,6 +1225,8 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
             // pop the last element from first array
             if(result_docs_arr.size() > 0 && result_docs_arr[0].size() > 0) {
                 result_docs_arr[0].erase(result_docs_arr[0].size() - 1);
+            } else {
+                break;
             }
         }
 
