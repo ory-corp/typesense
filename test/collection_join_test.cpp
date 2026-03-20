@@ -12251,7 +12251,7 @@ TEST_F(CollectionJoinTest, FixReferencesAtQueryTime) {
                         "include_fields": "id, $Products(id) "
                     },
                     {
-                        "collection": "Products",
+                        "collection": "Customers",
                         "q": "*",
                         "filter_by": "id:[0, 1, 2]",
                         "include_fields": "id, $Products(id) "
