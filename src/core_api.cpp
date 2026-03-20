@@ -672,7 +672,7 @@ bool get_search(const std::shared_ptr<http_req>& req, const std::shared_ptr<http
     std::string results_json_str;
     Option<bool> search_op = CollectionManager::do_search(req->params, req->embedded_params_vec[0],
                                                           results_json_str, req->conn_ts);
-    if(conversation) {
+    if(conversation && search_op.ok()) {
         nlohmann::json results_json = nlohmann::json::parse(results_json_str);
         results_json["conversation"] = nlohmann::json::object();
         results_json["conversation"]["query"] = query;
@@ -1190,6 +1190,8 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
             // pop the last element from first array
             if(result_docs_arr.size() > 0 && result_docs_arr[0].size() > 0) {
                 result_docs_arr[0].erase(result_docs_arr[0].size() - 1);
+            } else {
+                break;
             }
         }
 
