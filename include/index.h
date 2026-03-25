@@ -840,11 +840,9 @@ public:
                                      const std::vector<char>& symbols_to_index,
                                      std::unordered_set<std::string>& found_fields,
                                      const bool use_addition_fields = false,
-                                     const tsl::htrie_map<char, field>& addition_fields = tsl::htrie_map<char, field>(),
-                                     const std::string& collection_name = "");
+                                     const tsl::htrie_map<char, field>& addition_fields = tsl::htrie_map<char, field>());
 
-    void index_field_in_memory(const std::string& collection_name, const field& afield,
-                               std::vector<index_record>& iter_batch);
+    void index_field_in_memory(const field& afield, std::vector<index_record>& iter_batch);
 
     template<class T>
     void iterate_and_index_numerical_field(std::vector<index_record>& iter_batch, const field& afield, T func);
@@ -1227,9 +1225,9 @@ public:
 
     Option<bool> process_ref_include_fields_sort(std::vector<sort_by>& sort_fields_std, size_t limit, std::vector<uint32_t>& doc_ids);
 
-    static void update_async_references(const std::string& collection_name, std::vector<index_record>& iter_batch,
-                                        const spp::sparse_hash_map<std::string, std::set<reference_pair_t>>& async_referenced_ins =
-                                        spp::sparse_hash_map<std::string, std::set<reference_pair_t>>());
+    static Option<bool> update_async_references(const std::string& collection_name, const bool& return_doc, const bool& return_id,
+                                                const spp::sparse_hash_map<std::string, std::set<reference_pair_t>>& async_referenced_ins,
+                                                index_record& record, std::vector<std::string>& json_out);
 
     Option<bool> diversify_text_score_buckets(const std::vector<std::pair<size_t, size_t>>& bucket_indexes,
                                               const diversity_t& diversity,
