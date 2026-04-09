@@ -5616,7 +5616,7 @@ void Index::get_field_token_its(const size_t num_search_fields,
 
         if(its.empty()) {
             // this token does not have any match across *any* field: probably a typo
-            LOG(INFO) << "No matching field found for token: " << token_str;
+            //LOG(INFO) << "No matching field found for token: " << token_str;
             continue;
         }
 
