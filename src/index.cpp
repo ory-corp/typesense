@@ -127,6 +127,10 @@ Index::Index(const std::string& name, const uint32_t collection_id, const Store*
             infix_index.emplace(a_field.name, infix_sets);
         }
 
+        if(a_field.track_missing_values) {
+            field_missing_index.emplace(a_field.name, new id_list_t(ids_t::MAX_BLOCK_ELEMENTS));
+        }
+
         if (a_field.is_reference_helper && a_field.is_array()) {
             auto num_tree = new num_tree_t;
             reference_index.emplace(a_field.name, num_tree);
@@ -215,6 +219,11 @@ Index::~Index() {
 
     delete facet_index_v4;
     
+    for(auto& kv : field_missing_index) {
+        delete kv.second;
+    }
+    field_missing_index.clear();
+
     delete seq_ids;
 
     for(auto& vec_index_kv: vector_index) {
@@ -705,6 +714,22 @@ size_t Index::batch_memory_index(Index *index,
     {
         std::unique_lock<std::mutex> lock_process(m_process);
         cv_process.wait(lock_process, [&](){ return num_processed == num_queued; });
+    }
+
+    for (const auto& record : iter_batch) {
+        if (!record.indexed.ok() || record.operation == DELETE) {
+            continue;
+        }
+
+        const auto& final_doc = record.is_update ? record.new_doc : record.doc;
+        for (auto& [field_name, missing_list] : index->field_missing_index) {
+            const bool is_missing = final_doc.count(field_name) == 0 || final_doc[field_name].is_null();
+            if (is_missing) {
+                missing_list->upsert(record.seq_id);
+            } else {
+                missing_list->erase(record.seq_id);
+            }
+        }
     }
 
     return num_indexed;
@@ -7458,6 +7483,11 @@ void Index::remove_field(uint32_t seq_id, nlohmann::json& document, const std::s
         return;
     }
 
+    if(search_field.track_missing_values) {
+        if(field_missing_index.count(field_name) != 0)
+            field_missing_index[field_name]->erase(seq_id);
+    }
+
     if(search_field.optional && document[field_name].is_null()) {
         return ;
     }
@@ -7681,6 +7711,9 @@ Option<uint32_t> Index::remove(const uint32_t seq_id, nlohmann::json & document,
     }
 
     if(!is_update) {
+        for(auto& [fname, missing_list] : field_missing_index) {
+            missing_list->erase(seq_id);
+        }
         seq_ids->erase(seq_id);
     }
 
@@ -7807,6 +7840,19 @@ void Index::refresh_schemas(const std::vector<field>& new_fields, const std::vec
 
             infix_index.emplace(new_field.name, infix_sets);
         }
+
+        if(new_field.track_missing_values) {
+            if(field_missing_index.count(new_field.name) == 0) {
+                auto* missing_list = new id_list_t(ids_t::MAX_BLOCK_ELEMENTS);
+                // Backfill: all existing docs are missing this new field
+                auto iter = seq_ids->new_iterator();
+                while(iter.valid()) {
+                    missing_list->upsert(iter.id());
+                    iter.next();
+                }
+                field_missing_index.emplace(new_field.name, missing_list);
+            }
+        }
     }
 
     for(const auto & del_field: del_fields) {
@@ -7880,6 +7926,11 @@ void Index::refresh_schemas(const std::vector<field>& new_fields, const std::vec
             auto hnsw_index = vector_index[del_field.name];
             delete hnsw_index;
             vector_index.erase(del_field.name);
+        }
+
+        if(field_missing_index.count(del_field.name) != 0) {
+            delete field_missing_index[del_field.name];
+            field_missing_index.erase(del_field.name);
         }
     }
 }
