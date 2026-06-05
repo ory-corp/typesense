@@ -9718,6 +9718,878 @@ TEST_F(CollectionJoinTest, AsyncRefFieldAliasReference) {
     run_join_query("after restart");
 }
 
+TEST_F(CollectionJoinTest, AsyncRefFieldDeferredAliasReference) {
+    auto schema_json =
+            R"({
+                "name": "s1_child",
+                "fields": [
+                    {"name": "product_code", "type": "string", "reference": "s1_parent_alias.product_code", "async_reference": true},
+                    {"name": "note", "type": "string"}
+                ]
+            })"_json;
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto child = collection_create_op.get();
+
+    schema_json =
+            R"({
+                "name": "s1_parent",
+                "fields": [
+                    {"name": "product_code", "type": "string", "facet": true}
+                ]
+            })"_json;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto parent = collection_create_op.get();
+
+    auto symlink_op = collectionManager.upsert_symlink("s1_parent_alias", "s1_parent");
+    ASSERT_TRUE(symlink_op.ok()) << symlink_op.error();
+
+    auto add_op = parent->add(R"({"id":"p-11","product_code":"p-11"})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+
+    add_op = child->add(R"({"id":"c-1","product_code":"p-11","note":"x"})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+
+    auto run_join_query = [&](const std::string& stage) {
+        auto parent_coll = collectionManager.get_collection("s1_parent");
+        ASSERT_NE(nullptr, parent_coll) << stage;
+        auto async_refs = parent_coll->get_async_referenced_ins();
+        ASSERT_EQ(1, async_refs.size()) << stage;
+        ASSERT_EQ(1, async_refs.count("product_code")) << stage;
+        ASSERT_EQ(1, async_refs.at("product_code").count(reference_pair_t("s1_child", "product_code"))) << stage;
+
+        auto child_coll = collectionManager.get_collection("s1_child");
+        ASSERT_NE(nullptr, child_coll) << stage;
+        auto ref_fields = child_coll->get_reference_fields();
+        ASSERT_EQ(1, ref_fields.size()) << stage;
+        ASSERT_EQ("product_code", ref_fields.begin()->first);
+        ASSERT_EQ("s1_parent", ref_fields.begin()->second.collection) << stage;
+        ASSERT_EQ("product_code", ref_fields.begin()->second.field);
+        ASSERT_EQ("product_code", ref_fields.begin()->second.referenced_field.name);
+
+        std::map<std::string, std::string> req_params = {
+                {"collection", "s1_child"},
+                {"q", "*"},
+                {"query_by", "product_code"},
+                {"filter_by", "$s1_parent_alias(product_code:=`p-11`)"},
+        };
+        nlohmann::json embedded_params;
+        std::string json_res;
+        auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+
+        auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+        ASSERT_TRUE(search_op.ok()) << stage << ": " << search_op.error();
+
+        auto res_obj = nlohmann::json::parse(json_res);
+        ASSERT_EQ(1, res_obj["found"].get<size_t>()) << stage << ": " << json_res;
+        ASSERT_EQ(1, res_obj["hits"].size()) << stage << ": " << json_res;
+        ASSERT_EQ("c-1", res_obj["hits"][0]["document"]["id"].get<std::string>());
+        ASSERT_EQ("p-11", res_obj["hits"][0]["document"]["product_code"].get<std::string>());
+        ASSERT_EQ("x", res_obj["hits"][0]["document"]["note"].get<std::string>());
+    };
+
+    run_join_query("before restart");
+
+    collectionManager.dispose();
+    delete store;
+
+    store = new Store(state_dir_path);
+    collectionManager.init(store, 1.0, "auth_key", quit);
+    auto load_op = collectionManager.load(8, 1000);
+    ASSERT_TRUE(load_op.ok()) << load_op.error();
+
+    run_join_query("after restart");
+}
+
+TEST_F(CollectionJoinTest, AsyncRefFieldDeferredAliasReferenceBackfillsPreAliasChildDocs) {
+    auto schema_json =
+            R"({
+                "name": "child_referencing_parent_alias_v1",
+                "fields": [
+                    {"name": "product_code", "type": "string", "reference": "parent_alias_v1.product_code", "async_reference": true},
+                    {"name": "note", "type": "string"}
+                ]
+            })"_json;
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto child = collection_create_op.get();
+
+    schema_json =
+            R"({
+                "name": "parent_v1",
+                "fields": [
+                    {"name": "product_code", "type": "string", "facet": true}
+                ]
+            })"_json;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto parent = collection_create_op.get();
+
+    auto add_op = parent->add(R"({"id":"p-11","product_code":"p-11"})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+
+    add_op = child->add(R"({"id":"c-1","product_code":"p-11","note":"x"})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+
+    auto child_doc = child->get("c-1").get();
+    ASSERT_EQ("product_code_sequence_id", child_doc[".ref"][0]);
+    ASSERT_EQ(Join::reference_helper_sentinel_value, child_doc["product_code_sequence_id"]);
+
+    auto symlink_op = collectionManager.upsert_symlink("parent_alias_v1", "parent_v1");
+    ASSERT_TRUE(symlink_op.ok()) << symlink_op.error();
+
+    auto parent_coll = collectionManager.get_collection("parent_v1");
+    ASSERT_NE(nullptr, parent_coll);
+    auto async_refs = parent_coll->get_async_referenced_ins();
+    ASSERT_EQ(1, async_refs.size());
+    ASSERT_EQ(1, async_refs.count("product_code"));
+    ASSERT_EQ(1, async_refs.at("product_code").count(
+            reference_pair_t("child_referencing_parent_alias_v1", "product_code")));
+
+    auto child_coll = collectionManager.get_collection("child_referencing_parent_alias_v1");
+    ASSERT_NE(nullptr, child_coll);
+    auto ref_fields = child_coll->get_reference_fields();
+    ASSERT_EQ(1, ref_fields.size());
+    ASSERT_EQ("product_code", ref_fields.begin()->first);
+    ASSERT_EQ("parent_v1", ref_fields.begin()->second.collection);
+    ASSERT_EQ("product_code", ref_fields.begin()->second.field);
+    ASSERT_EQ("product_code", ref_fields.begin()->second.referenced_field.name);
+
+    child_doc = child_coll->get("c-1").get();
+    ASSERT_EQ(0, child_doc["product_code_sequence_id"]);
+
+    std::map<std::string, std::string> req_params = {
+            {"collection", "child_referencing_parent_alias_v1"},
+            {"q", "*"},
+            {"query_by", "product_code"},
+            {"filter_by", "$parent_alias_v1(product_code:=`p-11`)"},
+    };
+    nlohmann::json embedded_params;
+    std::string json_res;
+    auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok()) << search_op.error();
+
+    auto res_obj = nlohmann::json::parse(json_res);
+    ASSERT_EQ(1, res_obj["found"].get<size_t>()) << json_res;
+    ASSERT_EQ(1, res_obj["hits"].size()) << json_res;
+    ASSERT_EQ("c-1", res_obj["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ("p-11", res_obj["hits"][0]["document"]["product_code"].get<std::string>());
+    ASSERT_EQ("x", res_obj["hits"][0]["document"]["note"].get<std::string>());
+}
+
+TEST_F(CollectionJoinTest, AsyncRefFieldDeferredAliasReferenceBackfillsFilterSyntaxValues) {
+    const std::string parent_alias_v1_name = "parent_alias_v1_filter_syntax";
+    const std::string parent_v1_collection_name = "parent_v1_filter_syntax_values";
+    const std::string child_collection_name = "child_referencing_parent_alias_v1_filter_syntax";
+    const std::string reference_value = "p-11 && (";
+
+    auto schema_json =
+            R"({
+                "fields": [
+                    {"name": "product_code", "type": "string", "reference": "parent_alias_v1_filter_syntax.product_code", "async_reference": true},
+                    {"name": "note", "type": "string"}
+                ]
+            })"_json;
+    schema_json["name"] = child_collection_name;
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto child = collection_create_op.get();
+
+    schema_json =
+            R"({
+                "fields": [
+                    {"name": "product_code", "type": "string", "facet": true}
+                ]
+            })"_json;
+    schema_json["name"] = parent_v1_collection_name;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto parent_v1 = collection_create_op.get();
+
+    nlohmann::json parent_doc;
+    parent_doc["id"] = "p-v1";
+    parent_doc["product_code"] = reference_value;
+    auto add_op = parent_v1->add(parent_doc.dump());
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+    auto parent_v1_seq_id_op = parent_v1->doc_id_to_seq_id("p-v1");
+    ASSERT_TRUE(parent_v1_seq_id_op.ok()) << parent_v1_seq_id_op.error();
+
+    nlohmann::json child_doc;
+    child_doc["id"] = "c-1";
+    child_doc["product_code"] = reference_value;
+    child_doc["note"] = "x";
+    add_op = child->add(child_doc.dump());
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+
+    child_doc = child->get("c-1").get();
+    ASSERT_EQ("product_code_sequence_id", child_doc[".ref"][0]);
+    ASSERT_EQ(Join::reference_helper_sentinel_value, child_doc["product_code_sequence_id"]);
+
+    auto upsert_op = collectionManager.upsert_symlink(parent_alias_v1_name, parent_v1_collection_name);
+    ASSERT_TRUE(upsert_op.ok()) << upsert_op.error();
+
+    child_doc = child->get("c-1").get();
+    ASSERT_EQ(parent_v1_seq_id_op.get(), child_doc["product_code_sequence_id"]);
+
+    auto ref_fields = child->get_reference_fields();
+    ASSERT_EQ(1, ref_fields.size());
+    ASSERT_EQ(parent_v1_collection_name, ref_fields.begin()->second.collection);
+}
+
+TEST_F(CollectionJoinTest, AsyncRefFieldDeferredAliasReferenceBackfillsIdReferences) {
+    const std::string parent_alias_name = "bookings";
+    const std::string parent_collection_name = "production.bookings";
+    const std::string child_collection_name = "production.booking-payments";
+
+    auto schema_json =
+            R"({
+                "fields": [
+                    {"name": "bookingId", "type": "string", "facet": true, "sort": true,
+                     "reference": "bookings.id", "async_reference": true},
+                    {"name": "amount", "type": "int32", "facet": true}
+                ]
+            })"_json;
+    schema_json["name"] = child_collection_name;
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto booking_payments = collection_create_op.get();
+
+    auto add_op = booking_payments->add(R"({"id":"payment-1","bookingId":"booking-11","amount":100})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+
+    auto child_doc = booking_payments->get("payment-1").get();
+    ASSERT_EQ("bookingId_sequence_id", child_doc[".ref"][0]);
+    ASSERT_EQ(Join::reference_helper_sentinel_value, child_doc["bookingId_sequence_id"]);
+
+    schema_json =
+            R"({
+                "fields": [
+                    {"name": "tenant", "type": "string", "facet": true}
+                ]
+            })"_json;
+    schema_json["name"] = parent_collection_name;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto bookings = collection_create_op.get();
+
+    add_op = bookings->add(R"({"id":"booking-11","tenant":"prod"})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+    auto booking_seq_id_op = bookings->doc_id_to_seq_id("booking-11");
+    ASSERT_TRUE(booking_seq_id_op.ok()) << booking_seq_id_op.error();
+
+    auto upsert_op = collectionManager.upsert_symlink(parent_alias_name, parent_collection_name);
+    ASSERT_TRUE(upsert_op.ok()) << upsert_op.error();
+
+    child_doc = booking_payments->get("payment-1").get();
+    ASSERT_EQ(booking_seq_id_op.get(), child_doc["bookingId_sequence_id"]);
+
+    auto async_refs = bookings->get_async_referenced_ins();
+    ASSERT_EQ(1, async_refs.size());
+    ASSERT_EQ(1, async_refs.count("id"));
+    ASSERT_EQ(1, async_refs.at("id").count(reference_pair_t(child_collection_name, "bookingId")));
+
+    auto ref_fields = booking_payments->get_reference_fields();
+    ASSERT_EQ(1, ref_fields.size());
+    ASSERT_EQ(parent_collection_name, ref_fields.begin()->second.collection);
+    ASSERT_EQ("id", ref_fields.begin()->second.field);
+    ASSERT_EQ("id", ref_fields.begin()->second.referenced_field.name);
+
+    std::map<std::string, std::string> req_params = {
+            {"collection", child_collection_name},
+            {"q", "*"},
+            {"query_by", "bookingId"},
+            {"filter_by", "$bookings(tenant:=`prod`)"},
+    };
+    nlohmann::json embedded_params;
+    std::string json_res;
+    auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok()) << search_op.error();
+
+    auto res_obj = nlohmann::json::parse(json_res);
+    ASSERT_EQ(1, res_obj["found"].get<size_t>()) << json_res;
+    ASSERT_EQ(1, res_obj["hits"].size()) << json_res;
+    ASSERT_EQ("payment-1", res_obj["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ("booking-11", res_obj["hits"][0]["document"]["bookingId"].get<std::string>());
+}
+
+TEST_F(CollectionJoinTest, AsyncRefFieldExistingAliasReferenceResolvesWhenTargetCollectionIsCreated) {
+    const std::string parent_alias_name = "bookings_existing_alias";
+    const std::string parent_collection_name = "production.bookings_existing_alias";
+    const std::string child_collection_name = "production.booking_payments_existing_alias";
+
+    auto symlink_op = collectionManager.upsert_symlink(parent_alias_name, parent_collection_name);
+    ASSERT_TRUE(symlink_op.ok()) << symlink_op.error();
+
+    auto schema_json =
+            R"({
+                "fields": [
+                    {"name": "bookingId", "type": "string", "facet": true, "sort": true,
+                     "reference": "bookings_existing_alias.id", "async_reference": true},
+                    {"name": "amount", "type": "int32", "facet": true}
+                ]
+            })"_json;
+    schema_json["name"] = child_collection_name;
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto booking_payments = collection_create_op.get();
+
+    auto add_op = booking_payments->add(R"({"id":"payment-1","bookingId":"booking-11","amount":100})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+
+    auto child_doc = booking_payments->get("payment-1").get();
+    ASSERT_EQ("bookingId_sequence_id", child_doc[".ref"][0]);
+    ASSERT_EQ(Join::reference_helper_sentinel_value, child_doc["bookingId_sequence_id"]);
+
+    auto referenced_ins = collectionManager._get_referenced_ins();
+    ASSERT_EQ(1, referenced_ins.count(parent_alias_name));
+    ASSERT_EQ(1, referenced_ins.at(parent_alias_name).count(child_collection_name));
+    ASSERT_EQ("bookingId", referenced_ins.at(parent_alias_name).at(child_collection_name).field);
+
+    schema_json =
+            R"({
+                "fields": [
+                    {"name": "tenant", "type": "string", "facet": true}
+                ]
+            })"_json;
+    schema_json["name"] = parent_collection_name;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto bookings = collection_create_op.get();
+
+    auto async_refs = bookings->get_async_referenced_ins();
+    ASSERT_EQ(1, async_refs.size());
+    ASSERT_EQ(1, async_refs.count("id"));
+    ASSERT_EQ(1, async_refs.at("id").count(reference_pair_t(child_collection_name, "bookingId")));
+
+    auto ref_fields = booking_payments->get_reference_fields();
+    ASSERT_EQ(1, ref_fields.size());
+    ASSERT_EQ(parent_collection_name, ref_fields.begin()->second.collection);
+    ASSERT_EQ("id", ref_fields.begin()->second.field);
+    ASSERT_EQ("id", ref_fields.begin()->second.referenced_field.name);
+
+    add_op = bookings->add(R"({"id":"booking-11","tenant":"prod"})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+    auto booking_seq_id_op = bookings->doc_id_to_seq_id("booking-11");
+    ASSERT_TRUE(booking_seq_id_op.ok()) << booking_seq_id_op.error();
+
+    child_doc = booking_payments->get("payment-1").get();
+    ASSERT_EQ(booking_seq_id_op.get(), child_doc["bookingId_sequence_id"]);
+
+    std::map<std::string, std::string> req_params = {
+            {"collection", child_collection_name},
+            {"q", "*"},
+            {"query_by", "bookingId"},
+            {"filter_by", "$bookings_existing_alias(tenant:=`prod`)"},
+    };
+    nlohmann::json embedded_params;
+    std::string json_res;
+    auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok()) << search_op.error();
+
+    auto res_obj = nlohmann::json::parse(json_res);
+    ASSERT_EQ(1, res_obj["found"].get<size_t>()) << json_res;
+    ASSERT_EQ(1, res_obj["hits"].size()) << json_res;
+    ASSERT_EQ("payment-1", res_obj["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ("booking-11", res_obj["hits"][0]["document"]["bookingId"].get<std::string>());
+}
+
+TEST_F(CollectionJoinTest, AsyncRefFieldAliasCreatedBeforeTargetHydratesReferencedFieldOnRestart) {
+    const std::string parent_alias_name = "parent_alias_before_target";
+    const std::string parent_collection_name = "parent_created_after_alias";
+    const std::string child_collection_name = "child_referencing_alias_before_target";
+
+    auto schema_json =
+            R"({
+                "fields": [
+                    {"name": "product_code", "type": "string", "reference": "parent_alias_before_target.product_code", "async_reference": true},
+                    {"name": "note", "type": "string"}
+                ]
+            })"_json;
+    schema_json["name"] = child_collection_name;
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto child = collection_create_op.get();
+
+    auto symlink_op = collectionManager.upsert_symlink(parent_alias_name, parent_collection_name);
+    ASSERT_TRUE(symlink_op.ok()) << symlink_op.error();
+
+    schema_json =
+            R"({
+                "fields": [
+                    {"name": "product_code", "type": "string", "facet": true}
+                ]
+            })"_json;
+    schema_json["name"] = parent_collection_name;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto parent = collection_create_op.get();
+
+    auto add_op = parent->add(R"({"id":"p-11","product_code":"p-11"})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+    auto parent_seq_id_op = parent->doc_id_to_seq_id("p-11");
+    ASSERT_TRUE(parent_seq_id_op.ok()) << parent_seq_id_op.error();
+
+    add_op = child->add(R"({"id":"c-1","product_code":"p-11","note":"before restart"})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+    auto child_doc = child->get("c-1").get();
+    ASSERT_EQ(parent_seq_id_op.get(), child_doc["product_code_sequence_id"]);
+
+    collectionManager.dispose();
+    delete store;
+
+    store = new Store(state_dir_path);
+    collectionManager.init(store, 1.0, "auth_key", quit);
+    auto load_op = collectionManager.load(8, 1000);
+    ASSERT_TRUE(load_op.ok()) << load_op.error();
+
+    auto parent_coll = collectionManager.get_collection(parent_collection_name);
+    ASSERT_NE(nullptr, parent_coll);
+    auto async_refs = parent_coll->get_async_referenced_ins();
+    ASSERT_EQ(1, async_refs.size());
+    ASSERT_EQ(1, async_refs.count("product_code"));
+    ASSERT_EQ(1, async_refs.at("product_code").count(reference_pair_t(child_collection_name, "product_code")));
+
+    auto child_coll = collectionManager.get_collection(child_collection_name);
+    ASSERT_NE(nullptr, child_coll);
+    auto ref_fields = child_coll->get_reference_fields();
+    ASSERT_EQ(1, ref_fields.size());
+    ASSERT_EQ(parent_collection_name, ref_fields.begin()->second.collection);
+    ASSERT_EQ("product_code", ref_fields.begin()->second.field);
+    ASSERT_EQ("product_code", ref_fields.begin()->second.referenced_field.name);
+
+    add_op = child_coll->add(R"({"id":"c-2","product_code":"p-11","note":"after restart"})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+    child_doc = child_coll->get("c-2").get();
+    ASSERT_EQ(parent_seq_id_op.get(), child_doc["product_code_sequence_id"]);
+
+    std::map<std::string, std::string> req_params = {
+            {"collection", child_collection_name},
+            {"q", "*"},
+            {"query_by", "product_code"},
+            {"filter_by", "$parent_alias_before_target(product_code:=`p-11`)"},
+    };
+    nlohmann::json embedded_params;
+    std::string json_res;
+    auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok()) << search_op.error();
+
+    auto res_obj = nlohmann::json::parse(json_res);
+    ASSERT_EQ(2, res_obj["found"].get<size_t>()) << json_res;
+}
+
+TEST_F(CollectionJoinTest, FailedSymlinkUpsertBackfillPropagatesFilterValueErrors) {
+    const std::string parent_alias_v1_name = "parent_alias_v1_invalid_filter_value";
+    const std::string parent_v1_collection_name = "parent_v1_invalid_filter_values";
+    const std::string child_collection_name = "child_referencing_parent_alias_v1_invalid_filter_value";
+    const std::string reference_value = "`p-11` && (";
+
+    auto schema_json =
+            R"({
+                "fields": [
+                    {"name": "product_code", "type": "string", "reference": "parent_alias_v1_invalid_filter_value.product_code", "async_reference": true},
+                    {"name": "note", "type": "string"}
+                ]
+            })"_json;
+    schema_json["name"] = child_collection_name;
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto child = collection_create_op.get();
+
+    schema_json =
+            R"({
+                "fields": [
+                    {"name": "product_code", "type": "string", "facet": true}
+                ]
+            })"_json;
+    schema_json["name"] = parent_v1_collection_name;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto parent_v1 = collection_create_op.get();
+
+    nlohmann::json parent_doc;
+    parent_doc["id"] = "p-v1";
+    parent_doc["product_code"] = reference_value;
+    auto add_op = parent_v1->add(parent_doc.dump());
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+
+    nlohmann::json child_doc;
+    child_doc["id"] = "c-1";
+    child_doc["product_code"] = reference_value;
+    child_doc["note"] = "x";
+    add_op = child->add(child_doc.dump());
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+
+    auto upsert_op = collectionManager.upsert_symlink(parent_alias_v1_name, parent_v1_collection_name);
+    ASSERT_FALSE(upsert_op.ok());
+    ASSERT_EQ("Error while updating async reference field `product_code` of collection `" + child_collection_name +
+              "`: Filter value `" + reference_value + "` cannot be parsed.", upsert_op.error());
+    ASSERT_FALSE(collectionManager.resolve_symlink(parent_alias_v1_name).ok());
+    ASSERT_FALSE(store->contains(CollectionManager::get_symlink_key(parent_alias_v1_name)));
+
+    auto ref_fields = child->get_reference_fields();
+    ASSERT_EQ(1, ref_fields.size());
+    ASSERT_EQ(parent_alias_v1_name, ref_fields.begin()->second.collection);
+
+    child_doc = child->get("c-1").get();
+    ASSERT_EQ(Join::reference_helper_sentinel_value, child_doc["product_code_sequence_id"]);
+}
+
+TEST_F(CollectionJoinTest, FailedSymlinkUpsertMissingReferencedFieldPreservesDeferredReferences) {
+    const std::string parent_alias_name = "parent_alias_missing_code";
+    const std::string invalid_parent_collection_name = "parent_without_code";
+    const std::string valid_parent_collection_name = "parent_with_code";
+    const std::string child_collection_name = "child_referencing_parent_alias_missing_code";
+
+    auto schema_json =
+            R"({
+                "fields": [
+                    {"name": "code", "type": "string", "reference": "parent_alias_missing_code.code"},
+                    {"name": "note", "type": "string"}
+                ]
+            })"_json;
+    schema_json["name"] = child_collection_name;
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto child = collection_create_op.get();
+
+    auto referenced_ins = collectionManager._get_referenced_ins();
+    ASSERT_EQ(1, referenced_ins.count(parent_alias_name));
+    ASSERT_EQ(1, referenced_ins.at(parent_alias_name).count(child_collection_name));
+    ASSERT_EQ("code", referenced_ins.at(parent_alias_name).at(child_collection_name).field);
+    ASSERT_EQ("code", referenced_ins.at(parent_alias_name).at(child_collection_name).referenced_field_name);
+
+    schema_json =
+            R"({
+                "fields": [
+                    {"name": "name", "type": "string", "facet": true}
+                ]
+            })"_json;
+    schema_json["name"] = invalid_parent_collection_name;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+
+    auto upsert_op = collectionManager.upsert_symlink(parent_alias_name, invalid_parent_collection_name);
+    ASSERT_FALSE(upsert_op.ok());
+    ASSERT_EQ("Referenced field `code` not found in the collection `parent_without_code`.",
+              upsert_op.error());
+    ASSERT_FALSE(collectionManager.resolve_symlink(parent_alias_name).ok());
+    ASSERT_FALSE(store->contains(CollectionManager::get_symlink_key(parent_alias_name)));
+
+    referenced_ins = collectionManager._get_referenced_ins();
+    ASSERT_EQ(1, referenced_ins.count(parent_alias_name));
+    ASSERT_EQ(0, referenced_ins.count(invalid_parent_collection_name));
+    ASSERT_EQ(1, referenced_ins.at(parent_alias_name).count(child_collection_name));
+    ASSERT_EQ("code", referenced_ins.at(parent_alias_name).at(child_collection_name).field);
+
+    auto ref_fields = child->get_reference_fields();
+    ASSERT_EQ(1, ref_fields.size());
+    ASSERT_EQ(parent_alias_name, ref_fields.begin()->second.collection);
+    ASSERT_TRUE(ref_fields.begin()->second.referenced_field.name.empty());
+
+    schema_json =
+            R"({
+                "fields": [
+                    {"name": "code", "type": "string", "facet": true}
+                ]
+            })"_json;
+    schema_json["name"] = valid_parent_collection_name;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto valid_parent = collection_create_op.get();
+
+    upsert_op = collectionManager.upsert_symlink(parent_alias_name, valid_parent_collection_name);
+    ASSERT_TRUE(upsert_op.ok()) << upsert_op.error();
+
+    referenced_ins = collectionManager._get_referenced_ins();
+    ASSERT_EQ(0, referenced_ins.count(parent_alias_name));
+    ASSERT_EQ(1, referenced_ins.count(valid_parent_collection_name));
+    ASSERT_EQ(1, referenced_ins.at(valid_parent_collection_name).count(child_collection_name));
+
+    ref_fields = child->get_reference_fields();
+    ASSERT_EQ(1, ref_fields.size());
+    ASSERT_EQ(valid_parent_collection_name, ref_fields.begin()->second.collection);
+    ASSERT_EQ("code", ref_fields.begin()->second.referenced_field.name);
+
+    auto add_op = valid_parent->add(R"({"id":"p-11","code":"p-11"})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+    add_op = child->add(R"({"id":"c-1","code":"p-11","note":"ok"})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+}
+
+TEST_F(CollectionJoinTest, FailedSymlinkUpsertBackfillPreservesDeferredReferences) {
+    const std::string parent_alias_name = "parent_alias";
+    const std::string parent_v1_collection_name = "parent_v1_duplicate_codes";
+    const std::string parent_v2_collection_name = "parent_v2_unique_codes";
+    const std::string child_collection_name = "child_referencing_parent_alias";
+
+    auto schema_json =
+            R"({
+                "fields": [
+                    {"name": "product_code", "type": "string", "reference": "parent_alias.product_code", "async_reference": true},
+                    {"name": "note", "type": "string"}
+                ]
+            })"_json;
+    schema_json["name"] = child_collection_name;
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto child = collection_create_op.get();
+
+    schema_json =
+            R"({
+                "fields": [
+                    {"name": "product_code", "type": "string", "facet": true}
+                ]
+            })"_json;
+    schema_json["name"] = parent_v1_collection_name;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto parent_v1 = collection_create_op.get();
+
+    auto add_op = parent_v1->add(R"({"id":"p-v1-1","product_code":"p-11"})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+    add_op = parent_v1->add(R"({"id":"p-v1-2","product_code":"p-11"})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+
+    add_op = child->add(R"({"id":"c-1","product_code":"p-11","note":"x"})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+
+    auto child_doc = child->get("c-1").get();
+    ASSERT_EQ("product_code_sequence_id", child_doc[".ref"][0]);
+    ASSERT_EQ(Join::reference_helper_sentinel_value, child_doc["product_code_sequence_id"]);
+
+    auto upsert_op = collectionManager.upsert_symlink(parent_alias_name, parent_v1_collection_name);
+    ASSERT_FALSE(upsert_op.ok());
+    ASSERT_EQ("Error while updating async reference field `product_code` of collection `" + child_collection_name +
+              "`: The value `p-11` of the field `product_code` is not unique in `" + parent_v1_collection_name +
+              "` collection.", upsert_op.error());
+    ASSERT_FALSE(collectionManager.resolve_symlink(parent_alias_name).ok());
+    ASSERT_FALSE(store->contains(CollectionManager::get_symlink_key(parent_alias_name)));
+
+    auto referenced_ins = collectionManager._get_referenced_ins();
+    ASSERT_EQ(1, referenced_ins.count(parent_alias_name));
+    ASSERT_EQ(1, referenced_ins.at(parent_alias_name).count(child_collection_name));
+    ASSERT_EQ("product_code", referenced_ins.at(parent_alias_name).at(child_collection_name).field);
+
+    auto ref_fields = child->get_reference_fields();
+    ASSERT_EQ(1, ref_fields.size());
+    ASSERT_EQ(parent_alias_name, ref_fields.begin()->second.collection);
+    ASSERT_EQ(0, parent_v1->get_async_referenced_ins().size());
+
+    schema_json =
+            R"({
+                "fields": [
+                    {"name": "product_code", "type": "string", "facet": true}
+                ]
+            })"_json;
+    schema_json["name"] = parent_v2_collection_name;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+    auto parent_v2 = collection_create_op.get();
+
+    add_op = parent_v2->add(R"({"id":"p-v2","product_code":"p-11"})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+    auto parent_v2_seq_id_op = parent_v2->doc_id_to_seq_id("p-v2");
+    ASSERT_TRUE(parent_v2_seq_id_op.ok()) << parent_v2_seq_id_op.error();
+
+    upsert_op = collectionManager.upsert_symlink(parent_alias_name, parent_v2_collection_name);
+    ASSERT_TRUE(upsert_op.ok()) << upsert_op.error();
+
+    ref_fields = child->get_reference_fields();
+    ASSERT_EQ(1, ref_fields.size());
+    ASSERT_EQ(parent_v2_collection_name, ref_fields.begin()->second.collection);
+
+    child_doc = child->get("c-1").get();
+    ASSERT_EQ(parent_v2_seq_id_op.get(), child_doc["product_code_sequence_id"]);
+    ASSERT_EQ(0, collectionManager._get_referenced_ins().count(parent_alias_name));
+}
+
+TEST_F(CollectionJoinTest, FailedSymlinkUpsertPreservesDeferredReferences) {
+    const std::string parent_alias_v1_name = "parent_alias_v1";
+    const std::string parent_v1_collection_name = "parent_v1";
+    const std::string child_collection_name = "child_referencing_parent_v1_alias";
+
+    nlohmann::json child_schema;
+    child_schema["name"] = child_collection_name;
+    child_schema["fields"] = nlohmann::json::array({
+            {{"name", "parent_id"},
+             {"type", "string"},
+             {"reference", parent_alias_v1_name + ".id"},
+             {"async_reference", true}}
+    });
+
+    auto create_op = collectionManager.create_collection(child_schema);
+    ASSERT_TRUE(create_op.ok()) << create_op.error();
+
+    auto referenced_ins = collectionManager._get_referenced_ins();
+    ASSERT_EQ(1, referenced_ins.count(parent_alias_v1_name));
+    ASSERT_EQ(1, referenced_ins.at(parent_alias_v1_name).count(child_collection_name));
+    ASSERT_EQ("parent_id", referenced_ins.at(parent_alias_v1_name).at(child_collection_name).field);
+
+    nlohmann::json parent_v1_schema;
+    parent_v1_schema["name"] = parent_v1_collection_name;
+    parent_v1_schema["fields"] = nlohmann::json::array({
+            {{"name", "child_id"}, {"type", "string"}, {"reference", child_collection_name + ".id"}}
+    });
+
+    create_op = collectionManager.create_collection(parent_v1_schema);
+    ASSERT_TRUE(create_op.ok()) << create_op.error();
+
+    auto upsert_op = collectionManager.upsert_symlink(parent_alias_v1_name, parent_v1_collection_name);
+    ASSERT_FALSE(upsert_op.ok());
+    ASSERT_EQ("Collections having reference to each other are not allowed. `" + child_collection_name +
+              "` collection is referenced by `" + parent_v1_collection_name + "` collection's `child_id` field.",
+              upsert_op.error());
+    ASSERT_FALSE(collectionManager.resolve_symlink(parent_alias_v1_name).ok());
+    ASSERT_FALSE(store->contains(CollectionManager::get_symlink_key(parent_alias_v1_name)));
+
+    referenced_ins = collectionManager._get_referenced_ins();
+    ASSERT_EQ(1, referenced_ins.count(parent_alias_v1_name));
+    ASSERT_EQ(1, referenced_ins.at(parent_alias_v1_name).count(child_collection_name));
+    ASSERT_EQ("parent_id", referenced_ins.at(parent_alias_v1_name).at(child_collection_name).field);
+
+    const std::string parent_alias_name = "parent_alias";
+    const std::string parent_alias_v1_collection_name = "parent_alias_v1_collection";
+    const std::string parent_alias_v2_collection_name = "parent_alias_v2_collection";
+    const std::string child_for_parent_alias_name = "child_referencing_parent_alias";
+
+    upsert_op = collectionManager.upsert_symlink(parent_alias_name, parent_alias_v1_collection_name);
+    ASSERT_TRUE(upsert_op.ok()) << upsert_op.error();
+
+    auto alias_op = collectionManager.resolve_symlink(parent_alias_name);
+    ASSERT_TRUE(alias_op.ok()) << alias_op.error();
+    ASSERT_EQ(parent_alias_v1_collection_name, alias_op.get());
+
+    std::string persisted_parent_alias_collection_name;
+    ASSERT_EQ(StoreStatus::FOUND,
+              store->get(CollectionManager::get_symlink_key(parent_alias_name), persisted_parent_alias_collection_name));
+    ASSERT_EQ(parent_alias_v1_collection_name, persisted_parent_alias_collection_name);
+
+    nlohmann::json child_for_parent_alias_schema;
+    child_for_parent_alias_schema["name"] = child_for_parent_alias_name;
+    child_for_parent_alias_schema["fields"] = nlohmann::json::array({
+            {{"name", "parent_id"}, {"type", "string"},
+             {"reference", parent_alias_name + ".id"}, {"async_reference", true}}
+    });
+
+    create_op = collectionManager.create_collection(child_for_parent_alias_schema);
+    ASSERT_TRUE(create_op.ok()) << create_op.error();
+
+    referenced_ins = collectionManager._get_referenced_ins();
+    ASSERT_EQ(1, referenced_ins.count(parent_alias_name));
+    ASSERT_EQ(1, referenced_ins.at(parent_alias_name).count(child_for_parent_alias_name));
+    ASSERT_EQ("parent_id", referenced_ins.at(parent_alias_name).at(child_for_parent_alias_name).field);
+
+    nlohmann::json parent_alias_v2_schema;
+    parent_alias_v2_schema["name"] = parent_alias_v2_collection_name;
+    parent_alias_v2_schema["fields"] = nlohmann::json::array({
+            {{"name", "child_id"}, {"type", "string"}, {"reference", child_for_parent_alias_name + ".id"}}
+    });
+
+    create_op = collectionManager.create_collection(parent_alias_v2_schema);
+    ASSERT_TRUE(create_op.ok()) << create_op.error();
+
+    upsert_op = collectionManager.upsert_symlink(parent_alias_name, parent_alias_v2_collection_name);
+    ASSERT_FALSE(upsert_op.ok());
+    ASSERT_EQ("Collections having reference to each other are not allowed. `" + child_for_parent_alias_name +
+              "` collection is referenced by `" + parent_alias_v2_collection_name +
+              "` collection's `child_id` field.", upsert_op.error());
+
+    alias_op = collectionManager.resolve_symlink(parent_alias_name);
+    ASSERT_TRUE(alias_op.ok()) << alias_op.error();
+    ASSERT_EQ(parent_alias_v1_collection_name, alias_op.get());
+    ASSERT_EQ(StoreStatus::FOUND,
+              store->get(CollectionManager::get_symlink_key(parent_alias_name), persisted_parent_alias_collection_name));
+    ASSERT_EQ(parent_alias_v1_collection_name, persisted_parent_alias_collection_name);
+
+    referenced_ins = collectionManager._get_referenced_ins();
+    ASSERT_EQ(1, referenced_ins.count(parent_alias_name));
+    ASSERT_EQ(1, referenced_ins.at(parent_alias_name).count(child_for_parent_alias_name));
+    ASSERT_EQ("parent_id", referenced_ins.at(parent_alias_name).at(child_for_parent_alias_name).field);
+}
+
+TEST_F(CollectionJoinTest, FailedTargetCollectionCreateForExistingAliasRollsBack) {
+    const std::string parent_alias_name = "parent_alias_existing_target";
+    const std::string parent_collection_name = "parent_collection_existing_target";
+    const std::string child_collection_name = "child_referencing_existing_alias";
+
+    auto upsert_op = collectionManager.upsert_symlink(parent_alias_name, parent_collection_name);
+    ASSERT_TRUE(upsert_op.ok()) << upsert_op.error();
+
+    nlohmann::json child_schema;
+    child_schema["name"] = child_collection_name;
+    child_schema["fields"] = nlohmann::json::array({
+            {{"name", "parent_id"},
+             {"type", "string"},
+             {"reference", parent_alias_name + ".id"},
+             {"async_reference", true}}
+    });
+
+    auto create_op = collectionManager.create_collection(child_schema);
+    ASSERT_TRUE(create_op.ok()) << create_op.error();
+
+    auto referenced_ins = collectionManager._get_referenced_ins();
+    ASSERT_EQ(1, referenced_ins.count(parent_alias_name));
+    ASSERT_EQ(1, referenced_ins.at(parent_alias_name).count(child_collection_name));
+    ASSERT_EQ("parent_id", referenced_ins.at(parent_alias_name).at(child_collection_name).field);
+
+    nlohmann::json invalid_parent_schema;
+    invalid_parent_schema["name"] = parent_collection_name;
+    invalid_parent_schema["fields"] = nlohmann::json::array({
+            {{"name", "child_id"}, {"type", "string"}, {"reference", child_collection_name + ".id"}}
+    });
+
+    create_op = collectionManager.create_collection(invalid_parent_schema);
+    ASSERT_FALSE(create_op.ok());
+    ASSERT_EQ("Collections having reference to each other are not allowed. `" + child_collection_name +
+              "` collection is referenced by `" + parent_collection_name + "` collection's `child_id` field.",
+              create_op.error());
+
+    ASSERT_EQ(nullptr, collectionManager.get_collection(parent_collection_name));
+    ASSERT_EQ(nullptr, collectionManager.get_collection(parent_alias_name));
+    ASSERT_FALSE(store->contains(Collection::get_meta_key(parent_collection_name)));
+    ASSERT_FALSE(store->contains(Collection::get_next_seq_id_key(parent_collection_name)));
+
+    referenced_ins = collectionManager._get_referenced_ins();
+    ASSERT_EQ(1, referenced_ins.count(parent_alias_name));
+    ASSERT_EQ(1, referenced_ins.at(parent_alias_name).count(child_collection_name));
+    ASSERT_EQ("parent_id", referenced_ins.at(parent_alias_name).at(child_collection_name).field);
+
+    nlohmann::json valid_parent_schema;
+    valid_parent_schema["name"] = parent_collection_name;
+    valid_parent_schema["fields"] = nlohmann::json::array({
+            {{"name", "tenant"}, {"type", "string"}, {"facet", true}}
+    });
+
+    create_op = collectionManager.create_collection(valid_parent_schema);
+    ASSERT_TRUE(create_op.ok()) << create_op.error();
+    auto parent = create_op.get();
+
+    auto async_refs = parent->get_async_referenced_ins();
+    ASSERT_EQ(1, async_refs.size());
+    ASSERT_EQ(1, async_refs.count("id"));
+    ASSERT_EQ(1, async_refs.at("id").count(reference_pair_t(child_collection_name, "parent_id")));
+
+    auto child = collectionManager.get_collection(child_collection_name);
+    ASSERT_NE(nullptr, child);
+    auto ref_fields = child->get_reference_fields();
+    ASSERT_EQ(1, ref_fields.size());
+    ASSERT_EQ(parent_collection_name, ref_fields.begin()->second.collection);
+}
+
 TEST_F(CollectionJoinTest, AsyncRefFieldAliasReferenceWithoutPersistedReferencedIns) {
     auto schema_json =
             R"({
