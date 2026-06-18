@@ -2359,7 +2359,7 @@ Option<bool> CollectionManager::load_collection(const nlohmann::json &collection
                         << ": " << synonym_index_op.error();
               return Option<bool>(synonym_index_op.code(), synonym_index_op.error());
           }
-          SynonymIndex* synonym_index = synonym_index_op.get();
+          auto synonym_index = synonym_index_op.get();
 
           for(const auto & collection_synonym_json: collection_synonym_jsons) {
               nlohmann::json collection_synonym = nlohmann::json::parse(collection_synonym_json);

@@ -637,16 +637,16 @@ TEST_F(CollectionManagerTest, RestoreRecordsOnRestart) {
     ASSERT_STREQ("exclude-rule", ov_manager.list_curation_items("index", 0, 0).get()[0]["id"].get<std::string>().c_str());
     ASSERT_STREQ("include-rule", ov_manager.list_curation_items("index", 0, 0).get()[1]["id"].get<std::string>().c_str());
 
-    const auto& synonym_index = SynonymIndexManager::get_instance().get_synonym_index("index").get();
-    const auto& synonyms = synonym_index->get_synonyms().get();
+    auto synonym_index = SynonymIndexManager::get_instance().get_synonym_index("index").get();
+    const auto synonyms = synonym_index->get_synonyms().get();
 
-    ASSERT_STREQ("id1", synonyms.at(0)->id.c_str());
-    ASSERT_EQ(2, synonyms.at(0)->root.size());
-    ASSERT_EQ(1, synonyms.at(0)->synonyms.size());
+    ASSERT_STREQ("id1", synonyms.at(0).id.c_str());
+    ASSERT_EQ(2, synonyms.at(0).root.size());
+    ASSERT_EQ(1, synonyms.at(0).synonyms.size());
 
-    ASSERT_STREQ("id3", synonyms.at(1)->id.c_str());
-    ASSERT_EQ(0, synonyms.at(1)->root.size());
-    ASSERT_EQ(2, synonyms.at(1)->synonyms.size());
+    ASSERT_STREQ("id3", synonyms.at(1).id.c_str());
+    ASSERT_EQ(0, synonyms.at(1).root.size());
+    ASSERT_EQ(2, synonyms.at(1).synonyms.size());
 
     std::vector<char> expected_symbols = {'+'};
     std::vector<char> expected_separators = {'-'};
