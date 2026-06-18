@@ -549,7 +549,21 @@ void BatchedIndexer::serialize_state(nlohmann::json& state) {
 }
 
 void BatchedIndexer::load_state(const nlohmann::json& state) {
-    queued_writes = state["queued_writes"].get<int64_t>();
+    // `queued_writes` is a denormalized counter that must always equal the sum of the unprocessed chunks
+    // across the *complete* requests in `req_res_map`. Restoring it verbatim from the snapshot let a drifted
+    // value survive forever: e.g. a value that counted writes whose request entries were already gone would
+    // never be decremented (there is nothing left to process), and it would even be re-persisted and
+    // propagated to followers via InstallSnapshot. Instead we recompute it from the restored request map so
+    // that every load self-heals any inconsistency. Incomplete requests are intentionally excluded: they are
+    // not counted at enqueue time either, and will be counted by enqueue() when the raft log is replayed.
+    const int64_t persisted_queued_writes = state.contains("queued_writes") ?
+                                                state["queued_writes"].get<int64_t>() : 0;
+    queued_writes = 0;
+
+    // Tracked alongside `queued_writes` purely for the post-load sanity check below: by the time we log, the
+    // restored queues have been notified and a worker may have already decremented the live counter, so we
+    // must compare against this deterministic local total rather than re-reading `queued_writes`.
+    int64_t recomputed_queued_writes = 0;
 
     size_t num_reqs_restored = 0;
     std::set<uint64_t> queue_ids;
@@ -577,6 +591,14 @@ void BatchedIndexer::load_state(const nlohmann::json& state) {
                           kv.value()["next_chunk_index"].get<uint32_t>(),
                           kv.value()["is_complete"].get<bool>(),
                           latest_chunk_log_index);
+
+        // Recompute queued_writes from the request map (see note at the top of this method). Must happen
+        // before the request is queued below, so the counter is fully set before a worker can drain it.
+        if(req_res.is_complete && req_res.num_chunks > req_res.next_chunk_index) {
+            const int64_t remaining_chunks = req_res.num_chunks - req_res.next_chunk_index;
+            queued_writes += remaining_chunks;
+            recomputed_queued_writes += remaining_chunks;
+        }
 
         {
             std::unique_lock mlk(mutex);
@@ -659,6 +681,12 @@ void BatchedIndexer::load_state(const nlohmann::json& state) {
     }
 
     LOG(INFO) << "Restored " << num_reqs_restored << " in-flight requests from snapshot.";
+
+    if(persisted_queued_writes != recomputed_queued_writes) {
+        LOG(WARNING) << "Snapshot queued_writes (" << persisted_queued_writes << ") did not match the value "
+                     << "recomputed from " << num_reqs_restored << " restored requests ("
+                     << recomputed_queued_writes << "). Using the recomputed value.";
+    }
 }
 
 std::shared_mutex& BatchedIndexer::get_pause_mutex() {
