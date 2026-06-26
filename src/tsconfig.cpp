@@ -274,6 +274,7 @@ void Config::load_config_env() {
 
     this->skip_writes = ("TRUE" == get_env("TYPESENSE_SKIP_WRITES"));
     this->standalone = ("TRUE" == get_env("TYPESENSE_STANDALONE"));
+    this->ephemeral = ("TRUE" == get_env("TYPESENSE_EPHEMERAL"));
     if(!get_env("TYPESENSE_API_THREADS").empty()) {
         this->api_threads = std::stoi(get_env("TYPESENSE_API_THREADS"));
     }
@@ -537,6 +538,10 @@ void Config::load_config_file(cmdline::parser& options) {
         this->standalone = (reader.Get("server", "standalone", "false") == "true");
     }
 
+    if(reader.Exists("server", "ephemeral")) {
+        this->ephemeral = (reader.Get("server", "ephemeral", "false") == "true");
+    }
+
     if(reader.Exists("server", "api-threads")) {
         this->api_threads = (int) reader.GetInteger("server", "api-threads", 1);
     }
@@ -762,6 +767,10 @@ void Config::load_config_cmd_args(cmdline::parser& options)  {
 
     if(options.exist("standalone")) {
         this->standalone = options.get<bool>("standalone");
+    }
+
+    if(options.exist("ephemeral")) {
+        this->ephemeral = options.get<bool>("ephemeral");
     }
 
     if(options.exist("api-threads")) {

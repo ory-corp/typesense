@@ -151,10 +151,12 @@ int ReplicationState::start(const butil::EndPoint & peering_endpoint, const int 
 }
 
 int ReplicationState::start_standalone(int api_port) {
-    // No Raft. The document store was already opened (with its own WAL for crash durability), so
-    // we just load the collections from it into memory. We deliberately do NOT call
+    // No Raft. The document store was already opened above; unless --ephemeral was set it has its
+    // own RocksDB WAL, so any writes from a previous run have already been recovered by DB::Open.
+    // We just load the collections from the store into memory. We deliberately do NOT call
     // store->reload(true, ...) here: that clears the state dir, which the Raft path does so the
-    // replayed log can rebuild the store — there is no log to replay in standalone.
+    // replayed log can rebuild the store — there is no log to replay in standalone, and clearing it
+    // would throw away exactly the data we want to recover.
     int init_db_status = init_db();
     if(init_db_status != 0) {
         LOG(ERROR) << "Failed to initialize DB in standalone mode.";

@@ -73,6 +73,14 @@ private:
     // Single-node only; there is no replication or consensus in this mode.
     bool standalone = false;
 
+    // Standalone only. When true, the document store runs WITHOUT the RocksDB WAL:
+    // writes are not crash-durable and the dataset is rebuilt from an external source
+    // (e.g. a changefeed) on restart. When false (the default), standalone enables the
+    // RocksDB WAL so writes survive a process restart, recovered on the next DB open and
+    // replayed into the in-memory index by CollectionManager::load(). Ignored unless
+    // --standalone is set (with Raft, the Raft log is the WAL and this has no effect).
+    bool ephemeral = false;
+
     // Number of HTTP event-loop threads. Default 1 (single event loop, the
     // historical behavior). >1 runs that many h2o event loops, each with its own
     // listener (SO_REUSEPORT) and message receiver, so request intake/response
@@ -513,6 +521,10 @@ public:
 
     bool get_standalone() const {
         return standalone;
+    }
+
+    bool get_ephemeral() const {
+        return ephemeral;
     }
 
     uint32_t get_api_threads() const {

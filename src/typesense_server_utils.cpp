@@ -116,6 +116,7 @@ void init_cmdline_options(cmdline::parser & options, int argc, char **argv) {
     options.add<int>("memory-used-max-percentage", '\0', "Reject writes when memory usage exceeds this percentage. Default: 100 (never reject).", false, 100);
     options.add<bool>("skip-writes", '\0', "Skip all writes except config changes. Default: false.", false, false);
     options.add<bool>("standalone", '\0', "Run as a single node without Raft (no replication; higher write throughput). Default: false.", false, false);
+    options.add<bool>("ephemeral", '\0', "Standalone only: disable the RocksDB WAL so writes are not crash-durable and the dataset is rebuilt from an external source on restart. Default: false (writes survive restart).", false, false);
     options.add<uint32_t>("api-threads", '\0', "Number of HTTP event-loop threads (SO_REUSEPORT). Default: 1.", false, 1);
     options.add<bool>("reset-peers-on-error", '\0', "Reset node's peers on clustering error. Default: false.", false, false);
 
@@ -571,14 +572,16 @@ int run_server(const Config & config, const std::string & version, void (*master
     ThreadPool server_thread_pool(num_threads);
     ThreadPool replication_thread_pool(num_threads);
 
-    // primary DB used for storing the documents. Normally WAL is disabled because Raft's log
-    // provides durability; in --standalone there is no Raft, so enable RocksDB's own WAL so the
-    // document store is crash-durable and recovers on restart.
-    // Document store WAL stays disabled. In the Raft path, Raft's log is the WAL. In --standalone,
-    // the store is intentionally ephemeral: durability comes from the upstream source (the
-    // changefeed re-imports on restart), and enabling the store WAL here serializes every write
-    // through RocksDB's single WAL, which measurably caps parallel-ingestion throughput.
-    const bool disable_db_wal = true;
+    // Primary DB used for storing the documents. The store WAL is what makes a write survive a
+    // restart, so its setting depends on where durability comes from:
+    //   - Raft path (default): Raft's replication log is the WAL, so the store WAL is disabled.
+    //   - --standalone: there is no Raft, so enable the store WAL. Writes are then recovered on the
+    //     next DB open and replayed into the in-memory index by CollectionManager::load().
+    //   - --standalone --ephemeral: keep the store WAL disabled. Durability comes from the upstream
+    //     source (e.g. a changefeed re-imports on restart). This avoids the per-write WAL append and
+    //     is the fastest mode, at the cost of losing un-flushed writes on restart.
+    const bool disable_db_wal = !Config::get_instance().get_standalone() ||
+                                Config::get_instance().get_ephemeral();
     Store store(db_dir, 24*60*60, 1024, disable_db_wal, 0, db_write_buffer_size, db_max_write_buffer_number,
                 db_max_log_file_size, db_keep_log_file_num);
 
