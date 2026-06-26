@@ -256,12 +256,20 @@ public:
     }
 };
 
+struct http_message_dispatcher;
+
 struct http_req {
     static constexpr const char* AUTH_HEADER = "x-typesense-api-key";
     static constexpr const char* USER_HEADER = "x-typesense-user-id";
     static constexpr const char* AGENT_HEADER = "user-agent";
     static constexpr const char* CONTENT_TYPE_HEADER = "content-type";
     static constexpr const char* OCTET_STREAM_HEADER_VALUE = "application/octet-stream";
+
+    // The message dispatcher (event loop) that owns this request's connection. With multiple
+    // HTTP event loops (--api-threads > 1) the response MUST be delivered on the loop that owns
+    // the socket, so it is routed through this dispatcher rather than a global one. nullptr falls
+    // back to the server's default (loop 0) dispatcher.
+    http_message_dispatcher* res_dispatcher = nullptr;
 
     h2o_req_t* _req;
     std::string http_method;

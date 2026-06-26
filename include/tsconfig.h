@@ -73,6 +73,12 @@ private:
     // Single-node only; there is no replication or consensus in this mode.
     bool standalone = false;
 
+    // Number of HTTP event-loop threads. Default 1 (single event loop, the
+    // historical behavior). >1 runs that many h2o event loops, each with its own
+    // listener (SO_REUSEPORT) and message receiver, so request intake/response
+    // I/O scales across cores. Most useful with --standalone.
+    uint32_t api_threads = 1;
+
     std::atomic<int> log_slow_searches_time_ms;
 
     std::atomic<bool> reset_peers_on_error;
@@ -507,6 +513,10 @@ public:
 
     bool get_standalone() const {
         return standalone;
+    }
+
+    uint32_t get_api_threads() const {
+        return api_threads < 1 ? 1 : api_threads;
     }
 
     int get_max_per_page() const {

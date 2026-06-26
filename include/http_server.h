@@ -12,6 +12,8 @@ extern "C" {
 #include <map>
 #include <string>
 #include <cstdio>
+#include <vector>
+#include <thread>
 #include "http_data.h"
 #include "option.h"
 #include "threadpool.h"
@@ -124,6 +126,17 @@ private:
     h2o_hostconf_t *hostconf;
     h2o_socket_t* listener_socket;
 
+    // One additional HTTP event loop per extra --api-threads, each with its own context,
+    // listener (SO_REUSEPORT) and message receiver. Loop 0 is the members above (ctx /
+    // accept_ctx / listener_socket / message_dispatcher).
+    struct EvLoop {
+        h2o_context_t ctx;
+        h2o_accept_ctx_t accept_ctx{};
+        h2o_socket_t* listener = nullptr;
+        http_message_dispatcher* dispatcher = nullptr;
+    };
+    std::vector<EvLoop*> extra_loops;
+
     static const size_t ACTIVE_STREAM_WINDOW_SIZE = 196605;
     static const size_t REQ_TIMEOUT_MS = 60000;
 
@@ -180,6 +193,10 @@ private:
     static void on_metrics_refresh_timeout(h2o_timer_t *entry);
 
     int create_listener();
+
+    // Binds + listens a SO_REUSEPORT socket on (listen_address, listen_port), returning the fd
+    // (or -1). Each event loop registers its own listener on its own fd.
+    int bind_listen_fd();
 
     h2o_pathconf_t *register_handler(h2o_hostconf_t *hostconf, const char *path,
                                      int (*on_req)(h2o_handler_t *, h2o_req_t *));

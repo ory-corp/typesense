@@ -404,7 +404,9 @@ void ReplicationState::write(const std::shared_ptr<http_req>& request, const std
 
             if(response->is_alive && !async_res) {
                 async_req_res_t* req_res = new async_req_res_t(request, response, true);
-                message_dispatcher->send_message(HttpServer::STREAM_RESPONSE_MESSAGE, req_res);
+                // Deliver on the loop that owns this request's connection (multi event loop safe).
+                auto disp = request->res_dispatcher ? request->res_dispatcher : message_dispatcher;
+                disp->send_message(HttpServer::STREAM_RESPONSE_MESSAGE, req_res);
             }
 
             pending_writes--;

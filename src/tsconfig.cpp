@@ -274,6 +274,9 @@ void Config::load_config_env() {
 
     this->skip_writes = ("TRUE" == get_env("TYPESENSE_SKIP_WRITES"));
     this->standalone = ("TRUE" == get_env("TYPESENSE_STANDALONE"));
+    if(!get_env("TYPESENSE_API_THREADS").empty()) {
+        this->api_threads = std::stoi(get_env("TYPESENSE_API_THREADS"));
+    }
     this->enable_lazy_filter = ("TRUE" == get_env("TYPESENSE_ENABLE_LAZY_FILTER"));
     this->reset_peers_on_error = ("TRUE" == get_env("TYPESENSE_RESET_PEERS_ON_ERROR"));
 
@@ -534,6 +537,10 @@ void Config::load_config_file(cmdline::parser& options) {
         this->standalone = (reader.Get("server", "standalone", "false") == "true");
     }
 
+    if(reader.Exists("server", "api-threads")) {
+        this->api_threads = (int) reader.GetInteger("server", "api-threads", 1);
+    }
+
     if(reader.Exists("server", "skip-writes")) {
         auto skip_writes_str = reader.Get("server", "skip-writes", "false");
         this->skip_writes = (skip_writes_str == "true");
@@ -755,6 +762,10 @@ void Config::load_config_cmd_args(cmdline::parser& options)  {
 
     if(options.exist("standalone")) {
         this->standalone = options.get<bool>("standalone");
+    }
+
+    if(options.exist("api-threads")) {
+        this->api_threads = options.get<uint32_t>("api-threads");
     }
 
     if(options.exist("skip-writes")) {

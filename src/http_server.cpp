@@ -13,6 +13,12 @@
 #include "ratelimit_manager.h"
 #include "sole.hpp"
 #include "core_api.h"
+#include "tsconfig.h"
+
+// The message dispatcher (event loop) of the thread currently running an h2o event loop. Set by
+// each loop thread at startup; read in catch_all_handler to tag each request with its owning loop
+// so responses are delivered back on the correct loop (--api-threads > 1).
+thread_local http_message_dispatcher* tls_res_dispatcher = nullptr;
 
 HttpServer::HttpServer(const std::string & version, const std::string & listen_address,
                        uint32_t listen_port, const std::string & ssl_cert_path, const std::string & ssl_cert_key_path,
@@ -47,7 +53,9 @@ HttpServer::HttpServer(const std::string & version, const std::string & listen_a
 }
 
 void HttpServer::on_accept(h2o_socket_t *listener, const char *err) {
-    HttpServer* http_server = reinterpret_cast<HttpServer*>(listener->data);
+    // listener->data is the h2o_accept_ctx_t of the event loop that owns this listener (each loop
+    // has its own accept context so the connection is handled entirely on that loop).
+    h2o_accept_ctx_t* l_accept_ctx = reinterpret_cast<h2o_accept_ctx_t*>(listener->data);
     h2o_socket_t *sock;
 
     if (err != NULL) {
@@ -58,7 +66,7 @@ void HttpServer::on_accept(h2o_socket_t *listener, const char *err) {
         return;
     }
 
-    h2o_accept(http_server->accept_ctx, sock);
+    h2o_accept(l_accept_ctx, sock);
 }
 
 void HttpServer::on_metrics_refresh_timeout(h2o_timer_t *entry) {
@@ -125,10 +133,10 @@ int HttpServer::setup_ssl(const char *cert_file, const char *key_file) {
     return 0;
 }
 
-int HttpServer::create_listener() {
+int HttpServer::bind_listen_fd() {
     struct addrinfo hints;
     struct addrinfo *result, *rp;
-    int fd = -1, reuseaddr_flag = 1;
+    int fd = -1, reuseaddr_flag = 1, reuseport_flag = 1;
     std::string port_str = std::to_string(listen_port);
 
     std::string actual_address = listen_address;
@@ -179,6 +187,12 @@ int HttpServer::create_listener() {
             LOG(WARNING) << "Failed to set SO_REUSEADDR";
         }
 
+        // SO_REUSEPORT lets each HTTP event-loop thread bind its own listener on the same port;
+        // the kernel load-balances incoming connections across them (--api-threads > 1).
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuseport_flag, sizeof(reuseport_flag)) != 0) {
+            LOG(WARNING) << "Failed to set SO_REUSEPORT";
+        }
+
         if (bind(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
             // Successfully bound
             break;
@@ -203,6 +217,15 @@ int HttpServer::create_listener() {
         return -1;
     }
 
+    return fd;
+}
+
+int HttpServer::create_listener() {
+    int fd = bind_listen_fd();
+    if (fd < 0) {
+        return -1;
+    }
+
     if(!ssl_cert_path.empty() && !ssl_cert_key_path.empty()) {
         int ssl_setup_code = setup_ssl(ssl_cert_path.c_str(), ssl_cert_key_path.c_str());
         if(ssl_setup_code != 0) {
@@ -223,7 +246,7 @@ int HttpServer::create_listener() {
     accept_ctx->hosts = config.hosts;
 
     listener_socket = h2o_evloop_socket_create(ctx.loop, fd, H2O_SOCKET_FLAG_DONT_READ);
-    listener_socket->data = this;
+    listener_socket->data = accept_ctx;
     h2o_socket_read_start(listener_socket, on_accept);
 
     return 0;
@@ -245,8 +268,65 @@ int HttpServer::run(ReplicationState* replication_state) {
 
     message_dispatcher->on(STOP_SERVER_MESSAGE, HttpServer::on_stop_server);
 
+    // Loop 0 runs on this thread and uses the primary dispatcher.
+    tls_res_dispatcher = message_dispatcher;
+
+    // Start (api_threads - 1) additional event-loop threads. Each gets its own h2o context,
+    // listener (SO_REUSEPORT — the kernel load-balances accepts), and message receiver. A request
+    // is tagged with the dispatcher of the loop that accepted it (catch_all_handler), and its
+    // response is delivered through that dispatcher, so a loop only ever touches its own sockets.
+    // Multiple event loops are only wired for --standalone: the Raft write path delivers responses
+    // via the BatchedIndexer on loop 0, which would be cross-loop-unsafe. In Raft mode we force a
+    // single loop.
+    uint32_t api_threads = Config::get_instance().get_api_threads();
+    if(api_threads > 1 && !Config::get_instance().get_standalone()) {
+        LOG(WARNING) << "--api-threads > 1 requires --standalone; running with a single event loop.";
+        api_threads = 1;
+    }
+    std::vector<std::thread> extra_threads;
+    for(uint32_t i = 1; i < api_threads; i++) {
+        EvLoop* el = new EvLoop();
+        h2o_context_init(&el->ctx, h2o_evloop_create(), &config);
+        el->accept_ctx.ctx = &el->ctx;
+        el->accept_ctx.hosts = config.hosts;
+        el->accept_ctx.ssl_ctx = accept_ctx->ssl_ctx;
+        el->dispatcher = new http_message_dispatcher;
+        el->dispatcher->init(el->ctx.loop);
+        el->dispatcher->message_handlers = message_dispatcher->message_handlers;
+
+        int fd = bind_listen_fd();
+        if(fd < 0) {
+            LOG(ERROR) << "Failed to bind extra HTTP listener " << i;
+            delete el->dispatcher;
+            delete el;
+            continue;
+        }
+        el->listener = h2o_evloop_socket_create(el->ctx.loop, fd, H2O_SOCKET_FLAG_DONT_READ);
+        el->listener->data = &el->accept_ctx;
+        h2o_socket_read_start(el->listener, on_accept);
+
+        extra_loops.push_back(el);
+        extra_threads.emplace_back([this, el]() {
+            tls_res_dispatcher = el->dispatcher;
+            // Finite wait so the thread notices exit_loop even with no socket events pending.
+            while(!exit_loop) {
+                h2o_evloop_run(el->ctx.loop, 100);
+            }
+        });
+    }
+
+    if(api_threads > 1) {
+        LOG(INFO) << "HTTP server running with " << api_threads << " event-loop threads.";
+    }
+
     while(!exit_loop) {
         h2o_evloop_run(ctx.loop, INT32_MAX);
+    }
+
+    for(auto& t : extra_threads) {
+        if(t.joinable()) {
+            t.join();
+        }
     }
 
     return 0;
@@ -584,6 +664,10 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
                                                                    route_hash, query_map, embedded_params_vec,
                                                                    api_auth_key_sent, body, client_ip, is_binary_body);
 
+    // Tag the request with the dispatcher of the event loop handling it, so the response is
+    // delivered back on this same loop (the only thread allowed to touch this connection's socket).
+    request->res_dispatcher = tls_res_dispatcher;
+
     // add custom generator with a dispose function for cleaning up resources
     h2o_custom_generator_t* custom_gen = new h2o_custom_generator_t;
     std::shared_ptr<http_res> response = std::make_shared<http_res>(custom_gen);
@@ -837,7 +921,9 @@ int HttpServer::process_request(const std::shared_ptr<http_req>& request, const 
         if(!rpath->async_res) {
             // lifecycle of non async res will be owned by stream responder
             auto req_res = new async_req_res_t(request, response, true);
-            message_dispatcher->send_message(HttpServer::STREAM_RESPONSE_MESSAGE, req_res);
+            // Deliver on the loop that owns this request's connection (multi event loop safe).
+            auto disp = request->res_dispatcher ? request->res_dispatcher : message_dispatcher;
+            disp->send_message(HttpServer::STREAM_RESPONSE_MESSAGE, req_res);
         }
         //LOG(INFO) << "Response done " << response.get();
     });
