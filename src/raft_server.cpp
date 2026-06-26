@@ -150,6 +150,34 @@ int ReplicationState::start(const butil::EndPoint & peering_endpoint, const int 
     return 0;
 }
 
+int ReplicationState::start_standalone(int api_port) {
+    // No Raft. The document store was already opened (with its own WAL for crash durability), so
+    // we just load the collections from it into memory. We deliberately do NOT call
+    // store->reload(true, ...) here: that clears the state dir, which the Raft path does so the
+    // replayed log can rebuild the store — there is no log to replay in standalone.
+    int init_db_status = init_db();
+    if(init_db_status != 0) {
+        LOG(ERROR) << "Failed to initialize DB in standalone mode.";
+        return init_db_status;
+    }
+
+    // Present as a healthy, caught-up leader so reads, /health, and the leader-only code paths
+    // (analytics, conversations, …) behave exactly as on a normal single node.
+    node = nullptr;
+    read_caught_up = true;
+    write_caught_up = true;
+    leader_term.store(1, butil::memory_order_release);
+
+    {
+        std::lock_guard<std::mutex> lk(mcv);
+        ready = true;
+    }
+    cv.notify_all();
+
+    LOG(INFO) << "Standalone state machine ready (api_port " << api_port << ").";
+    return 0;
+}
+
 // can return empty string if DNS resolution fails on all nodes
 std::string ReplicationState::to_nodes_config(const butil::EndPoint& peering_endpoint, const int api_port,
                                               const std::string& nodes_config) {
@@ -336,6 +364,53 @@ void ReplicationState::write(const std::shared_ptr<http_req>& request, const std
             auto req_res = new async_req_res_t(request, response, true);
             return message_dispatcher->send_message(HttpServer::STREAM_RESPONSE_MESSAGE, req_res);
         }
+    }
+
+    if(config->get_standalone()) {
+        // STANDALONE: no Raft. Apply the write directly. async_req requests stream their body in
+        // via async_req_cb (which accumulates into request->body); only the final chunk carries
+        // the complete body, so wait for it before dispatching.
+        if(!request->last_chunk_aggregate) {
+            return;
+        }
+
+        request->log_index = standalone_seq.fetch_add(1, std::memory_order_relaxed);
+        pending_writes++;
+
+        route_path* rpath = nullptr;
+        server->get_route(request->route_hash, &rpath);
+
+        // Serialize per collection: same collection -> same stripe -> never concurrent; different
+        // collections -> (almost always) different stripes -> run in parallel across the pool.
+        const auto coll_it = request->params.find("collection");
+        const std::string coll = (coll_it != request->params.end()) ? coll_it->second : std::string();
+        const size_t stripe = std::hash<std::string>{}(coll) % NUM_WRITE_STRIPES;
+
+        thread_pool->enqueue([this, request, response, rpath, stripe]() {
+            bool async_res = (rpath != nullptr && rpath->async_res);
+            if(rpath != nullptr) {
+                std::lock_guard<std::mutex> lk(write_stripes[stripe]);
+                try {
+                    rpath->handler(request, response);
+                } catch(const std::exception& e) {
+                    LOG(ERROR) << "Exception in standalone write handler: " << e.what();
+                    response->set_400("Bad request.");
+                    async_res = false;
+                }
+            } else {
+                response->set_404();
+                async_res = false;
+            }
+
+            if(response->is_alive && !async_res) {
+                async_req_res_t* req_res = new async_req_res_t(request, response, true);
+                message_dispatcher->send_message(HttpServer::STREAM_RESPONSE_MESSAGE, req_res);
+            }
+
+            pending_writes--;
+        });
+
+        return;
     }
 
     std::shared_lock lock(node_mutex);
@@ -919,6 +994,11 @@ bool ReplicationState::is_alive() const {
 }
 
 uint64_t ReplicationState::node_state() const {
+    if(config->get_standalone()) {
+        // braft::State LEADER == 1; report it so health/status treat us as a healthy leader.
+        return 1;
+    }
+
     std::shared_lock lock(node_mutex);
 
     if(node == nullptr) {
@@ -1089,6 +1169,11 @@ int64_t ReplicationState::get_num_queued_writes() {
 }
 
 bool ReplicationState::is_leader() {
+    if(config->get_standalone()) {
+        // Single node, no Raft: we are always the leader.
+        return true;
+    }
+
     std::shared_lock lock(node_mutex);
 
     if(!node) {

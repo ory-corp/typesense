@@ -115,6 +115,7 @@ void init_cmdline_options(cmdline::parser & options, int argc, char **argv) {
     options.add<int>("disk-used-max-percentage", '\0', "Reject writes when used disk space exceeds this percentage. Default: 100 (never reject).", false, 100);
     options.add<int>("memory-used-max-percentage", '\0', "Reject writes when memory usage exceeds this percentage. Default: 100 (never reject).", false, 100);
     options.add<bool>("skip-writes", '\0', "Skip all writes except config changes. Default: false.", false, false);
+    options.add<bool>("standalone", '\0', "Run as a single node without Raft (no replication; higher write throughput). Default: false.", false, false);
     options.add<bool>("reset-peers-on-error", '\0', "Reset node's peers on clustering error. Default: false.", false, false);
 
     options.add<int>("log-slow-searches-time-ms", '\0', "When >= 0, searches that take longer than this duration are logged.", false, 30*1000);
@@ -368,6 +369,23 @@ int start_raft_server(ReplicationState& replication_state, Store& store,
                       uint32_t api_port, int snapshot_interval_seconds, int snapshot_max_byte_count_per_rpc,
                       const std::atomic<bool>& reset_peers_on_error) {
 
+    if(Config::get_instance().get_standalone()) {
+        // STANDALONE: no Raft. Bring the state machine up directly (load collections from the
+        // durable store), then idle this thread until shutdown. Writes are applied directly by
+        // ReplicationState::write() instead of going through the Raft log.
+        LOG(INFO) << "Starting Typesense in STANDALONE mode (no Raft, single node).";
+        if(replication_state.start_standalone(api_port) != 0) {
+            LOG(ERROR) << "Failed to start standalone state machine.";
+            exit(-1);
+        }
+        while (!brpc::IsAskedToQuit() && !quit_raft_service.load()) {
+            sleep(1);
+        }
+        LOG(INFO) << "Standalone service is going to quit.";
+        replication_state.shutdown();
+        return 0;
+    }
+
     if(path_to_nodes.empty()) {
         LOG(INFO) << "Since no --nodes argument is provided, starting a single node Typesense cluster.";
     }
@@ -552,8 +570,11 @@ int run_server(const Config & config, const std::string & version, void (*master
     ThreadPool server_thread_pool(num_threads);
     ThreadPool replication_thread_pool(num_threads);
 
-    // primary DB used for storing the documents: we will not use WAL since Raft provides that
-    Store store(db_dir, 24*60*60, 1024, true, 0, db_write_buffer_size, db_max_write_buffer_number,
+    // primary DB used for storing the documents. Normally WAL is disabled because Raft's log
+    // provides durability; in --standalone there is no Raft, so enable RocksDB's own WAL so the
+    // document store is crash-durable and recovers on restart.
+    const bool disable_db_wal = !config.get_standalone();
+    Store store(db_dir, 24*60*60, 1024, disable_db_wal, 0, db_write_buffer_size, db_max_write_buffer_number,
                 db_max_log_file_size, db_keep_log_file_num);
 
     // meta DB for storing house keeping things
