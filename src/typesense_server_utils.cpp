@@ -573,7 +573,11 @@ int run_server(const Config & config, const std::string & version, void (*master
     // primary DB used for storing the documents. Normally WAL is disabled because Raft's log
     // provides durability; in --standalone there is no Raft, so enable RocksDB's own WAL so the
     // document store is crash-durable and recovers on restart.
-    const bool disable_db_wal = !config.get_standalone();
+    // Document store WAL stays disabled. In the Raft path, Raft's log is the WAL. In --standalone,
+    // the store is intentionally ephemeral: durability comes from the upstream source (the
+    // changefeed re-imports on restart), and enabling the store WAL here serializes every write
+    // through RocksDB's single WAL, which measurably caps parallel-ingestion throughput.
+    const bool disable_db_wal = true;
     Store store(db_dir, 24*60*60, 1024, disable_db_wal, 0, db_write_buffer_size, db_max_write_buffer_number,
                 db_max_log_file_size, db_keep_log_file_num);
 
