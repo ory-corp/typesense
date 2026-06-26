@@ -1,6 +1,8 @@
 filegroup(
     name = "all_srcs",
-    srcs = glob(["**"]),
+    # winml/test/collateral contains a path with a space ("...maçã/foo.onnx")
+    # that rules_foreign_cc cannot stage; exclude it (test collateral only).
+    srcs = glob(["**"], exclude = ["winml/test/collateral/**"]),
     visibility = ["//visibility:public"],
 )
 

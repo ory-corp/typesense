@@ -341,7 +341,10 @@ register_detected_cuda_toolchains()
 new_git_repository(
     name= "snowball",
     build_file = "//bazel:snowball.BUILD",
-    branch = "master",
+    # Upstream renamed the default branch master -> main; pin the commit so the
+    # build is reproducible (local build-env fix, not part of --standalone).
+    commit = "ab7521d409980baefd7e92a2744cb5517efed148",
+    shallow_since = "1709200000 +0000",
     remote = "https://github.com/snowballstem/snowball.git"
 )
 
