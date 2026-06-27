@@ -2,6 +2,7 @@
 
 #include <collection_manager.h>
 #include <timsort.hpp>
+#include <regex>
 
 Option<bool> Join::single_value_filter_query(nlohmann::json& document, const std::string& field_name,
                                              const std::string& ref_field_type, std::string& filter_value,

@@ -1,5 +1,6 @@
 #include <string>
 #include <vector>
+#include <regex>
 #include <json.hpp>
 #include <app_metrics.h>
 #include <analytics_manager.h>

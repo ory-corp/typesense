@@ -2,6 +2,7 @@
 #include <posting.h>
 #include <timsort.hpp>
 #include <stack>
+#include <regex>
 #include "filter.h"
 
 Option<bool> filter::validate_numerical_filter_value(field _field, const string &raw_value) {
