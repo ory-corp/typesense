@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef TYPESENSE_ENABLE_AI
+#include "image_embedder_mock.h"
+#else
+
 #include <memory>
 #include <vector>
 #include <mutex>
@@ -36,3 +40,5 @@ class CLIPImageEmbedder : public ImageEmbedder {
             return ImageEmbedderType::clip;
         }
 };
+
+#endif // TYPESENSE_ENABLE_AI

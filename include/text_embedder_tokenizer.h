@@ -1,5 +1,9 @@
 #pragma
 
+#ifndef TYPESENSE_ENABLE_AI
+#include "text_embedder_tokenizer_mock.h"
+#else
+
 #include <vector>
 #include <unordered_map>
 #include <sentencepiece_processor.h>
@@ -89,3 +93,5 @@ class CLIPTokenizerWrapper : public TextEmbeddingTokenizer {
             return TokenizerType::clip;
         }
 };
+
+#endif // TYPESENSE_ENABLE_AI

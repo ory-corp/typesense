@@ -1,14 +1,13 @@
 #pragma once
 
-#ifndef TYPESENSE_ENABLE_AI
-#include "vq_model_mock.h"
-#else
+// Mock of vq_model.h for builds without AI features (no whisper.cpp).
+// The VQModel base is identical to the real one (it is whisper-free); only the
+// concrete WhisperModel is replaced with a non-functional stub.
 
 #include <string>
 #include <vector>
 #include <mutex>
 #include <shared_mutex>
-#include <whisper.h>
 
 #include "string_utils.h"
 #include "option.h"
@@ -39,19 +38,17 @@ class VQModel {
         VQModel(const std::string& model_name) : model_name(model_name) {}
 };
 
+// Forward declaration only: keeps WhisperModel's signatures intact for the
+// (real, still-compiled) vq model manager without pulling in whisper.cpp.
+struct whisper_context;
 
 class WhisperModel : public VQModel {
-    private:
-        whisper_context* ctx = nullptr;
-        whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-        bool read_wav(const void* data, size_t size, std::vector<float>& pcmf32);
-        std::mutex mutex;
     public:
         WhisperModel() = delete;
-        WhisperModel(whisper_context* ctx, const std::string& model_name);
-        static whisper_context* validate_and_load_model(const std::string& model_path);
-        ~WhisperModel();
-        virtual Option<std::string> transcribe(const std::string& audio_base64) override;
+        WhisperModel(whisper_context* /*ctx*/, const std::string& model_name) : VQModel(model_name) {}
+        static whisper_context* validate_and_load_model(const std::string& /*model_path*/) { return nullptr; }
+        ~WhisperModel() {}
+        Option<std::string> transcribe(const std::string& /*audio_base64*/) override {
+            return Option<std::string>(400, "Voice query (audio) models are disabled in this build (built without AI features).");
+        }
 };
-
-#endif // TYPESENSE_ENABLE_AI

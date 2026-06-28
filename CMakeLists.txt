@@ -27,6 +27,18 @@ endif()
 set(TYPESENSE_VERSION "nightly" CACHE STRING "")
 set(BUILD_DEPS "yes" CACHE STRING "")
 
+# Build with AI features (text/image embedders, personalization, voice query).
+# These require onnxruntime (which statically links opencv), whisper and
+# sentencepiece. Turn off to build without those dependencies:
+#   cmake ... -DTYPESENSE_ENABLE_AI=OFF
+option(TYPESENSE_ENABLE_AI "Build with AI features (onnxruntime, opencv, whisper)" ON)
+if(TYPESENSE_ENABLE_AI)
+    add_compile_definitions(TYPESENSE_ENABLE_AI)
+    message(STATUS "AI features: ENABLED (onnxruntime, opencv, whisper)")
+else()
+    message(STATUS "AI features: DISABLED (building without onnxruntime/opencv/whisper)")
+endif()
+
 if(NOT EXISTS ${DEP_ROOT_DIR})
     file(MAKE_DIRECTORY ${DEP_ROOT_DIR})
 endif()
@@ -61,8 +73,10 @@ ELSE()
     set(ENV{CMAKE_FIND_LIBRARY_SUFFIXES} ".a")
 ENDIF()
 
-include(cmake/onnxruntime.cmake)
-include(cmake/onnxruntime_ext.cmake)
+if(TYPESENSE_ENABLE_AI)
+    include(cmake/onnxruntime.cmake)
+    include(cmake/onnxruntime_ext.cmake)
+endif()
 include(cmake/For.cmake)
 include(cmake/H2O.cmake)
 include(cmake/RocksDB.cmake)
@@ -90,6 +104,18 @@ message("OpenSSL library: ${OPENSSL_LIBRARIES}")
 FILE(GLOB SRC_FILES src/*.cpp ${DEP_ROOT_DIR}/${KAKASI_NAME}/data/*.cpp)
 FILE(GLOB TEST_FILES test/*.cpp)
 
+if(NOT TYPESENSE_ENABLE_AI)
+    # Drop the onnxruntime/opencv/whisper-backed AI translation units; the mock
+    # headers provide the class definitions instead.
+    list(REMOVE_ITEM SRC_FILES
+        ${CMAKE_SOURCE_DIR}/src/text_embedder.cpp
+        ${CMAKE_SOURCE_DIR}/src/text_embedder_tokenizer.cpp
+        ${CMAKE_SOURCE_DIR}/src/image_embedder.cpp
+        ${CMAKE_SOURCE_DIR}/src/image_processor.cpp
+        ${CMAKE_SOURCE_DIR}/src/personalization_model.cpp
+        ${CMAKE_SOURCE_DIR}/src/aq_model.cpp)
+endif()
+
 include_directories(include)
 include_directories(include/tsl)
 include_directories(/usr/local/include)
@@ -110,8 +136,10 @@ include_directories(${DEP_ROOT_DIR}/${LRUCACHE_NAME}/include)
 include_directories(${DEP_ROOT_DIR}/${KAKASI_NAME}/build/include)
 include_directories(${DEP_ROOT_DIR}/${KAKASI_NAME}/data)
 include_directories(${DEP_ROOT_DIR}/${HNSW_NAME})
-include_directories(${DEP_ROOT_DIR}/${ONNX_NAME}/include/onnxruntime)
-include_directories(${DEP_ROOT_DIR}/${ONNX_EXT_NAME}/operators/src_dir)
+if(TYPESENSE_ENABLE_AI)
+    include_directories(${DEP_ROOT_DIR}/${ONNX_NAME}/include/onnxruntime)
+    include_directories(${DEP_ROOT_DIR}/${ONNX_EXT_NAME}/operators/src_dir)
+endif()
 
 
 link_directories(/usr/local/lib)
@@ -123,18 +151,20 @@ link_directories(${DEP_ROOT_DIR}/${ICONV_NAME}/lib/.libs)
 link_directories(${DEP_ROOT_DIR}/${JEMALLOC_NAME}/lib)
 link_directories(${DEP_ROOT_DIR}/${S2_NAME}/build)
 link_directories(${DEP_ROOT_DIR}/${KAKASI_NAME}/build/lib)
-link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib)
-link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/onnx-build)
-link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/re2-build)
-link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/abseil_cpp-build)
-link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/abseil_cpp-build/absl)
-link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/abseil_cpp-build/absl/base)
-link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/protobuf-build)
-link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/abseil_cpp-build/absl/container)
-link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/abseil_cpp-build/absl/hash)
-link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/pytorch_cpuinfo-build)
-link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/pytorch_cpuinfo-build/deps)
-link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/pytorch_cpuinfo-build/deps/clog)
+if(TYPESENSE_ENABLE_AI)
+    link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib)
+    link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/onnx-build)
+    link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/re2-build)
+    link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/abseil_cpp-build)
+    link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/abseil_cpp-build/absl)
+    link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/abseil_cpp-build/absl/base)
+    link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/protobuf-build)
+    link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/abseil_cpp-build/absl/container)
+    link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/abseil_cpp-build/absl/hash)
+    link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/pytorch_cpuinfo-build)
+    link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/pytorch_cpuinfo-build/deps)
+    link_directories(${DEP_ROOT_DIR}/${ONNX_NAME}-build/lib/_deps/pytorch_cpuinfo-build/deps/clog)
+endif()
 
 set(JEMALLOC_ROOT_DIR "${DEP_ROOT_DIR}/${JEMALLOC_NAME}")
 FIND_PACKAGE(Jemalloc REQUIRED)
@@ -144,6 +174,7 @@ add_executable(search ${SRC_FILES} src/main/main.cpp)
 add_executable(benchmark ${SRC_FILES} src/main/benchmark.cpp)
 add_executable(typesense-test ${SRC_FILES} ${TEST_FILES})
 
+if(TYPESENSE_ENABLE_AI)
 add_library(ONNX_SESSION IMPORTED STATIC)
 set_target_properties(ONNX_SESSION PROPERTIES IMPORTED_LOCATION ${DEP_ROOT_DIR}/${ONNX_NAME}-build/libonnxruntime_session.a)
 add_library(ONNX_OPT STATIC IMPORTED)
@@ -188,6 +219,7 @@ add_library(CPUI STATIC IMPORTED)
 set_target_properties(CPUI PROPERTIES IMPORTED_LOCATION ${DEP_ROOT_DIR}/${ONNX_NAME}-build/_deps/pytorch_cpuinfo-build/libcpuinfo.a)
 add_library(CLOG STATIC IMPORTED)
 set_target_properties(CLOG PROPERTIES IMPORTED_LOCATION ${DEP_ROOT_DIR}/${ONNX_NAME}-build/_deps/pytorch_cpuinfo-build/deps/clog/libclog.a)
+endif() # TYPESENSE_ENABLE_AI
 
 target_compile_definitions(
     typesense-server PRIVATE
@@ -228,31 +260,38 @@ else()
 endif()
 
 set(ICU_ALL_LIBRARIES ${ICU_I18N_LIBRARIES} ${ICU_LIBRARIES} ${ICU_DATA_LIBRARIES})
+set(ONNX_LIBS "")
+if(TYPESENSE_ENABLE_AI)
+    set(ONNX_LIBS ONNX_SESSION ONNX_OPT ONNX_PRO ONNX_UTL ONNX_FRM ONNX_GRP ONNX_MLS ONNX_CMN ONNX_FLT ONNX ONNX_PRT ONNX_PRTL ONNX_RE ABSL ABSL_DEL ABSL_RW ABSL_HSH ABSL_CTY ABSL_LL NSYNC CPUI CLOG)
+endif()
+
 set(CORE_LIBS kakasi h2o-evloop braft brpc iconv ${ICU_ALL_LIBRARIES} ${CURL_LIBRARIES} for s2
               ${LevelDB_LIBRARIES} ${ROCKSDB_LIBS}
               glog ${GFLAGS_LIBRARIES} ${PROTOBUF_LIBRARIES} ${STACKTRACE_LIBS}
               ${OPENSSL_LIBRARIES} ${ZLIB_LIBRARIES} ${JEMALLOC_LIBRARIES}
-              ${SYSTEM_LIBS} pthread dl ${STD_LIB} ONNX_SESSION ONNX_OPT ONNX_PRO ONNX_UTL ONNX_FRM ONNX_GRP ONNX_MLS ONNX_CMN ONNX_FLT ONNX ONNX_PRT ONNX_PRTL ONNX_RE ABSL ABSL_DEL ABSL_RW ABSL_HSH ABSL_CTY ABSL_LL NSYNC CPUI CLOG)
+              ${SYSTEM_LIBS} pthread dl ${STD_LIB} ${ONNX_LIBS})
 
 target_link_libraries(typesense-server ${CORE_LIBS})
 target_link_libraries(search ${CORE_LIBS})
 target_link_libraries(benchmark ${CORE_LIBS})
 target_link_libraries(typesense-test ${CORE_LIBS} gtest gtest_main)
 
-add_dependencies(typesense-server onnxruntime)
-add_dependencies(typesense-test onnxruntime)
-add_dependencies(benchmark onnxruntime)
-add_dependencies(search onnxruntime)
+if(TYPESENSE_ENABLE_AI)
+    add_dependencies(typesense-server onnxruntime)
+    add_dependencies(typesense-test onnxruntime)
+    add_dependencies(benchmark onnxruntime)
+    add_dependencies(search onnxruntime)
 
-# add source files from ${DEP_ROOT_DIR}/${ONNX_EXT_NAME} directory to targets
-set(ONNX_EXT_SRC_FILES ${DEP_ROOT_DIR}/${ONNX_EXT_NAME}/operators/src_dir/ustring.cc ${DEP_ROOT_DIR}/${ONNX_EXT_NAME}/operators/src_dir/string_utils_onnx.cc ${DEP_ROOT_DIR}/${ONNX_EXT_NAME}/operators/src_dir/base64.cc ${DEP_ROOT_DIR}/${ONNX_EXT_NAME}/operators/src_dir/tokenizer/bert_tokenizer.cc ${DEP_ROOT_DIR}/${ONNX_EXT_NAME}/operators/src_dir/tokenizer/basic_tokenizer.cc) 
-set_source_files_properties(${ONNX_EXT_SRC_FILES} PROPERTIES GENERATED TRUE)
-target_sources(typesense-server PRIVATE ${ONNX_EXT_SRC_FILES})
-target_sources(typesense-test PRIVATE ${ONNX_EXT_SRC_FILES})
-target_sources(benchmark PRIVATE ${ONNX_EXT_SRC_FILES})
-target_sources(search PRIVATE ${ONNX_EXT_SRC_FILES})
+    # add source files from ${DEP_ROOT_DIR}/${ONNX_EXT_NAME} directory to targets
+    set(ONNX_EXT_SRC_FILES ${DEP_ROOT_DIR}/${ONNX_EXT_NAME}/operators/src_dir/ustring.cc ${DEP_ROOT_DIR}/${ONNX_EXT_NAME}/operators/src_dir/string_utils_onnx.cc ${DEP_ROOT_DIR}/${ONNX_EXT_NAME}/operators/src_dir/base64.cc ${DEP_ROOT_DIR}/${ONNX_EXT_NAME}/operators/src_dir/tokenizer/bert_tokenizer.cc ${DEP_ROOT_DIR}/${ONNX_EXT_NAME}/operators/src_dir/tokenizer/basic_tokenizer.cc)
+    set_source_files_properties(${ONNX_EXT_SRC_FILES} PROPERTIES GENERATED TRUE)
+    target_sources(typesense-server PRIVATE ${ONNX_EXT_SRC_FILES})
+    target_sources(typesense-test PRIVATE ${ONNX_EXT_SRC_FILES})
+    target_sources(benchmark PRIVATE ${ONNX_EXT_SRC_FILES})
+    target_sources(search PRIVATE ${ONNX_EXT_SRC_FILES})
 
-add_dependencies(typesense-server onnxruntime_ext)
-add_dependencies(typesense-test onnxruntime_ext)
-add_dependencies(benchmark onnxruntime_ext)
-add_dependencies(search onnxruntime_ext)
+    add_dependencies(typesense-server onnxruntime_ext)
+    add_dependencies(typesense-test onnxruntime_ext)
+    add_dependencies(benchmark onnxruntime_ext)
+    add_dependencies(search onnxruntime_ext)
+endif()

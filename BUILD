@@ -12,9 +12,24 @@ compilation_database(
     ],
 )
 
+# Translation units that implement the onnxruntime/opencv/whisper-backed AI
+# classes. They are compiled only when AI is enabled; when --define=ai=off they
+# are dropped from the build and the mock headers provide the class definitions.
+AI_ONLY_SRCS = [
+    "src/text_embedder.cpp",
+    "src/text_embedder_tokenizer.cpp",
+    "src/image_embedder.cpp",
+    "src/image_processor.cpp",
+    "src/personalization_model.cpp",
+    "src/aq_model.cpp",
+]
+
 filegroup(
     name = "src_files",
-    srcs = glob(["src/*.cpp"]),
+    srcs = glob(["src/*.cpp"], exclude = AI_ONLY_SRCS) + select({
+        ":disable_ai": [],
+        "//conditions:default": AI_ONLY_SRCS,
+    }),
 )
 
 cc_library(
@@ -31,20 +46,39 @@ config_setting(
     define_values = { "use_cuda": "on" }
 )
 
+# Build without AI features (onnxruntime, opencv, whisper, sentencepiece, clip).
+# Enable with: bazel build --define=ai=off //:typesense-server
+config_setting(
+    name = "disable_ai",
+    define_values = { "ai": "off" }
+)
+
+# Dependencies that exist solely to power AI features. These pull in onnxruntime
+# (which statically links opencv), whisper.cpp, sentencepiece and the CLIP
+# tokenizer. They are dropped entirely when --define=ai=off.
+AI_DEPS = [
+    "@onnx_runtime//:onnxruntime_lib",
+    "@sentencepiece",
+    "@sentencepiece//:sentencepiece_headers",
+    "@clip_tokenizer//:clip",
+    "@whisper.cpp//:whisper",
+    "@whisper.cpp//:whisper_headers",
+]
+
 cc_library(
     name = "common_deps",
     defines = [
         "NDEBUG",
-    ],
+    ] + select({
+        ":disable_ai": [],
+        "//conditions:default": ["TYPESENSE_ENABLE_AI"],
+    }),
     linkopts = select({
         "@platforms//os:macos": ["-framework Foundation -framework SystemConfiguration"],
         "//conditions:default": [],
     }),
     deps = [
         ":headers",
-        "@onnx_runtime//:onnxruntime_lib",
-        "@sentencepiece",
-        "@sentencepiece//:sentencepiece_headers",
         "@com_github_brpc_braft//:braft",
         "@com_github_brpc_brpc//:brpc",
         "@com_github_google_glog//:glog",
@@ -59,14 +93,14 @@ cc_library(
         "@rocksdb",
         "@s2geometry",
         "@hnsw",
-        "@clip_tokenizer//:clip",
-        "@whisper.cpp//:whisper",
-        "@whisper.cpp//:whisper_headers",
         "@snowball",
         "@snowball//:snowball_headers",
         "@archive",
         # "@zip",
-    ])
+    ] + select({
+        ":disable_ai": [],
+        "//conditions:default": AI_DEPS,
+    }))
 
 cc_library(
     name = "linux_deps",

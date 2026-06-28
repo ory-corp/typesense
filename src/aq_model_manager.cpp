@@ -93,6 +93,10 @@ Option<bool> VQModelManager::download_model(const std::string& model_name) {
 }
 
 Option<std::shared_ptr<VQModel>> VQModelManager::validate_and_init_model(const std::string& model_name) {
+#ifndef TYPESENSE_ENABLE_AI
+    // Fail fast before any model download: this build has no voice-query runtime.
+    return Option<std::shared_ptr<VQModel>>(400, "Voice query (audio) models are disabled in this build (built without AI features).");
+#endif
     if(models.find(model_name) != models.end()) {
         return Option<std::shared_ptr<VQModel>>(models[model_name]);
     }

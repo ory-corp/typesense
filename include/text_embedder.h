@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef TYPESENSE_ENABLE_AI
+#include "text_embedder_mock.h"
+#else
+
 #include <sentencepiece_processor.h>
 #include <core/session/onnxruntime_cxx_api.h>
 #include <tokenizer/bert_tokenizer.hpp>
@@ -59,3 +63,5 @@ class TextEmbedder {
         bool is_image_embedding_model = false;
         std::mutex mutex_;
 };
+
+#endif // TYPESENSE_ENABLE_AI

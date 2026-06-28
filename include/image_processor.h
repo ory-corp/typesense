@@ -1,5 +1,8 @@
 #pragma once
 
+#ifndef TYPESENSE_ENABLE_AI
+#include "image_processor_mock.h"
+#else
 
 #include <mutex>
 #include <vector>
@@ -24,5 +27,7 @@ class CLIPImageProcessor : public ImageProcessor {
 
     public:
         CLIPImageProcessor(const std::string& model_path);
-        Option<processed_image_t> process_image(const std::string& image) override;  
+        Option<processed_image_t> process_image(const std::string& image) override;
 };
+
+#endif // TYPESENSE_ENABLE_AI

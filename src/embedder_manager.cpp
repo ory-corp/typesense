@@ -8,6 +8,10 @@ EmbedderManager& EmbedderManager::get_instance() {
 }
 
 Option<bool> EmbedderManager::validate_and_init_model(const nlohmann::json& model_config, size_t& num_dims) {
+#ifndef TYPESENSE_ENABLE_AI
+    // Fail fast before any model download: this build has no embedding runtime.
+    return Option<bool>(400, "Embedding models are disabled in this build (built without AI features).");
+#endif
     const std::string& model_name = model_config["model_name"].get<std::string>();
 
     if(is_remote_model(model_name)) {

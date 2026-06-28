@@ -1,4 +1,7 @@
 #pragma once
+#ifndef TYPESENSE_ENABLE_AI
+#include "personalization_model_mock.h"
+#else
 #include <string>
 #include <vector>
 #include <map>
@@ -56,3 +59,5 @@ private:
     std::unique_ptr<TextEmbeddingTokenizer> tokenizer_;
     void initialize_session();
 };
+
+#endif // TYPESENSE_ENABLE_AI
