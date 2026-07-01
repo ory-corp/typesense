@@ -119,6 +119,21 @@ COPTS = [
     "-Werror=return-type",
     "-O2",
     "-g",
+    # WORKAROUND for a GCC 10.5.0 aarch64 -O2 code-generation bug (RTL global CSE).
+    # In nlohmann::json's serializer::dump_integer, GCSE commons the address of the
+    # static `digits_to_99` table across the digit-pair loop's exit path and the
+    # standalone two-digit path, but the merged code reaches the shared two-digit
+    # store with the table base register holding a stale (GOT-page) value on the
+    # loop-exit path. As a result every positive integer with an even number of
+    # digits >= 4 is serialized with its leading two bytes read from garbage memory
+    # (e.g. 5000 -> "\xAA\xAA00", 1782855450 -> "p\xD082855450"). This silently
+    # writes unparsable documents to the on-disk store ("Error while parsing stored
+    # document." on read-back) and mangles integer fields (counts, timestamps, ids,
+    # prices) in HTTP responses. amd64 is unaffected; the nlohmann source is correct.
+    # Disabling RTL GCSE removes the bad commoning; tree-SSA PRE still runs, so the
+    # performance impact is negligible. Durable fix: build with a newer GCC and drop
+    # this flag. See typesense/search-sidecar/validation.md.
+    "-fno-gcse",
 ]
 
 ASAN_COPTS = [
