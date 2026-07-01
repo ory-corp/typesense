@@ -975,7 +975,15 @@ void HttpServer::defer_processing(const std::shared_ptr<http_req>& req, const st
         h2o_timer_unlink(&req->defer_timer.timer);
     }
 
-    h2o_timer_link(ctx.loop, timeout_ms, &req->defer_timer.timer);
+    // Schedule the timer on the event loop that owns this request's connection.
+    // With --api-threads > 1 the request may belong to an extra loop; linking the
+    // timer to loop 0 (ctx.loop) would both race on loop 0's timerwheel and fire
+    // the continuation on the wrong thread, stalling streamed responses (e.g.
+    // /documents/export) once backpressure kicks in. res_dispatcher is the owning
+    // loop's dispatcher; both callers (response_proceed, on_deferred_processing_message)
+    // already run on that loop, so linking here is single-threaded and correct.
+    h2o_loop_t* owning_loop = (req->res_dispatcher != nullptr) ? req->res_dispatcher->loop : ctx.loop;
+    h2o_timer_link(owning_loop, timeout_ms, &req->defer_timer.timer);
 
     if(exit_loop) {
         // otherwise, replication thread could be stuck waiting on a future

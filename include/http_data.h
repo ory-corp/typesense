@@ -539,7 +539,13 @@ struct http_message_dispatcher {
     h2o_multithread_receiver_t* message_receiver;
     std::map<std::string, bool (*)(void*)> message_handlers;
 
+    // The event loop this dispatcher delivers on. With multiple HTTP event loops
+    // (--api-threads > 1) deferred work must be scheduled on the owning loop, not
+    // loop 0; defer_processing reads this to link its timer to the right loop.
+    h2o_loop_t* loop = nullptr;
+
     void init(h2o_loop_t *loop) {
+        this->loop = loop;
         message_queue = h2o_multithread_create_queue(loop);
         message_receiver = new h2o_multithread_receiver_t();
         h2o_multithread_register_receiver(message_queue, message_receiver, on_message);
