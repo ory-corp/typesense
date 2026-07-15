@@ -151,7 +151,7 @@ namespace {
 
 TEST(RaftServerTest, DecompressesHighlyCompressibleGzipAcrossChunks) {
     auto& config = Config::get_instance();
-    ReplicationState replication_state(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, false,
+    ReplicationState replication_state(nullptr, nullptr, nullptr, nullptr, nullptr, false,
                                        &config, 1, 1);
     const std::string payload(1024 * 1024, 'a');
     z_stream compressor{};
@@ -180,7 +180,7 @@ TEST(RaftServerTest, DecompressesHighlyCompressibleGzipAcrossChunks) {
 
 TEST(RaftServerTest, SnapshotLoadGateBlocksReadinessAndCatchupRefresh) {
     auto& config = Config::get_instance();
-    ReplicationState replication_state(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, false,
+    ReplicationState replication_state(nullptr, nullptr, nullptr, nullptr, nullptr, false,
                                        &config, 1, 1);
 
     replication_state.read_caught_up = true;
@@ -206,7 +206,7 @@ TEST(RaftServerTest, RestoresBatchedIndexerStateByStoreStatusAndFailsClosed) {
     std::atomic<bool> skip_writes(false);
     auto& config = Config::get_instance();
     BatchedIndexer indexer(nullptr, nullptr, nullptr, 1, config, skip_writes);
-    ReplicationState replication_state(nullptr, &indexer, nullptr, nullptr, nullptr, nullptr, false,
+    ReplicationState replication_state(nullptr, &indexer, nullptr, nullptr, nullptr, false,
                                        &config, 1, 1);
 
     auto read_error_res = seed_indexer_request(indexer, 10, true);
@@ -269,7 +269,7 @@ TEST(RaftServerTest, RestoresEmptyAndLegacyNullBatchedIndexerState) {
     EXPECT_TRUE(empty_state["req_res_map"].empty());
 
     BatchedIndexer restored_indexer(nullptr, nullptr, nullptr, 1, config, skip_writes);
-    ReplicationState replication_state(nullptr, &restored_indexer, nullptr, nullptr, nullptr, nullptr, false,
+    ReplicationState replication_state(nullptr, &restored_indexer, nullptr, nullptr, nullptr, false,
                                        &config, 1, 1);
     seed_indexer_request(restored_indexer, 10, false);
     EXPECT_EQ(0, replication_state.restore_batched_indexer_state(
@@ -403,7 +403,7 @@ TEST(RaftServerTest, FailedPeerRefreshPreservesLiveMembership) {
     ASSERT_TRUE(raft_node.wait_for_leader());
 
     auto& config = Config::get_instance();
-    ReplicationState replication_state(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, false,
+    ReplicationState replication_state(nullptr, nullptr, nullptr, nullptr, nullptr, false,
                                        &config, 1, 1);
     replication_state.node = raft_node.node;
     std::atomic<bool> reset_peers_on_error(true);
@@ -428,7 +428,7 @@ TEST(RaftServerTest, FreshNodeWaitsForUnresolvedHostsUntilQuit) {
     std::filesystem::remove_all(raft_dir);
 
     auto& config = Config::get_instance();
-    ReplicationState replication_state(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, false,
+    ReplicationState replication_state(nullptr, nullptr, nullptr, nullptr, nullptr, false,
                                        &config, 1, 1);
 
     butil::EndPoint peering_endpoint;
