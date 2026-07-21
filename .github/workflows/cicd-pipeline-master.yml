@@ -1,7 +1,8 @@
 name: Typesense - MASTER Pipeline
 
-# Builds each commit on the default branch (v31, not master) and promotes it
-# into the staging registry.
+# Builds each commit on the default branch (v31, not master) as a
+# multi-platform image (amd64 + arm64) and promotes it into the staging
+# registry.
 #
 # Not wildcarded, unlike the PR pipeline: staging-images:latest tracks one
 # release line, so only the current default branch should publish to it.
@@ -26,8 +27,15 @@ concurrency:
 
 jobs:
   build-image:
-    name: Build typesense (dirty)
-    runs-on: ubuntu-22.04
+    name: Build typesense (dirty, ${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     permissions:
       id-token: write
@@ -42,15 +50,35 @@ jobs:
           image_repo: europe-west3-docker.pkg.dev/ory-artifacts/dirty-images
           image_name: typesense
           image_tag: ${{ github.sha }}
+          architecture: ${{ matrix.arch }}
           # Empty on a push event, so the action falls back to the commit SHA.
           typesense_version: ${{ inputs.version }}
           bazel_cache_key: ${{ vars.BAZEL_CACHE_KEY != '' && vars.BAZEL_CACHE_KEY || 'image-build' }}
 
+  merge-image:
+    name: Merge multi-arch image
+    needs:
+      - build-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Merge per-arch images
+        uses: ./.github/actions/image-merge
+        with:
+          image_repo: europe-west3-docker.pkg.dev/ory-artifacts/dirty-images
+          image_name: typesense
+          image_tag: ${{ github.sha }}
+
   docker-push:
     name: Push Staging Image
     needs:
-      - build-image
-    if: ${{ !failure() && !cancelled() && needs.build-image.result == 'success' }}
+      - merge-image
+    if: ${{ !failure() && !cancelled() && needs.merge-image.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -75,6 +103,7 @@ jobs:
       - name: Log in to Artifact Registry
         run: gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin "${REPO}"
       # SHA-pinned: third-party action, runs with a registry token in reach.
+      # crane-based, so it copies the whole multi-arch manifest list.
       - name: Push typesense image
         uses: akhilerm/tag-push-action@eadeefebd39db8a47e146115649adae1fce576a6 # v2.3.0
         env:
