@@ -15,13 +15,6 @@ if [[ "$@" == *"--graviton2"* ]] || [[ "$@" == *"--arm"* ]]; then
   ARCH_NAME="arm64"
 fi
 
-# GCC 10.5's GCSE pass miscompiles nlohmann's dump_integer on aarch64,
-# corrupting serialized integers in JSON output; disable it there.
-ARCH_FLAGS=""
-if [[ "$(uname -m)" == "aarch64" ]]; then
-  ARCH_FLAGS="--copt=-fno-gcse"
-fi
-
 if [[ "$@" == *"--with-cuda"* ]]; then
   CUDA_FLAGS="--define use_cuda=on --action_env=CUDA_HOME=/usr/local/cuda --action_env=CUDNN_HOME=/usr/local/cuda"
 fi
@@ -40,19 +33,19 @@ if [[ "$@" =~ --jobs=([0-9]+) ]]; then
 fi
 
 # First build protobuf
-bazel build --jobs=$JOBS $ARCH_FLAGS @com_google_protobuf//:protobuf_headers
-bazel build --jobs=$JOBS $ARCH_FLAGS @com_google_protobuf//:protobuf_lite
-bazel build --jobs=$JOBS $ARCH_FLAGS @com_google_protobuf//:protobuf
-bazel build --jobs=$JOBS $ARCH_FLAGS @com_google_protobuf//:protoc
+bazel build --jobs=$JOBS @com_google_protobuf//:protobuf_headers
+bazel build --jobs=$JOBS @com_google_protobuf//:protobuf_lite
+bazel build --jobs=$JOBS @com_google_protobuf//:protobuf
+bazel build --jobs=$JOBS @com_google_protobuf//:protoc
 
 # Build whisper
 if [[ "$@" == *"--with-cuda"* ]]; then
-  bazel build --jobs=$JOBS $ARCH_FLAGS @whisper.cpp//:whisper_cuda_shared $CUDA_FLAGS --experimental_cc_shared_library
+  bazel build --jobs=$JOBS @whisper.cpp//:whisper_cuda_shared $CUDA_FLAGS --experimental_cc_shared_library
   /bin/cp -f $PROJECT_DIR/$BUILD_DIR/external/whisper.cpp/libwhisper_cuda_shared.so $PROJECT_DIR/$BUILD_DIR/
 fi
 
 # Finally build Typesense
-bazel build --verbose_failures --jobs=$JOBS $ARCH_FLAGS $CUDA_FLAGS $JEMALLOC_FLAGS \
+bazel build --verbose_failures --jobs=$JOBS $CUDA_FLAGS $JEMALLOC_FLAGS \
   --define=TYPESENSE_VERSION=\"$TYPESENSE_VERSION\" //:$TYPESENSE_TARGET
 
 # Copy the binary to an accessible location

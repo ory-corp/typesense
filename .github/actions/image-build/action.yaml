@@ -134,6 +134,11 @@ runs:
         disk-cache: ${{ inputs.bazel_cache_key }}
         repository-cache: true
         external-cache: true
+        # GCC 10.5's GCSE pass miscompiles nlohmann's dump_integer on aarch64,
+        # corrupting integers in serialized JSON. Injected via the user-level
+        # bazelrc (picked up by every bazel invocation in ci_build_v2.sh) so
+        # that script stays identical to upstream.
+        bazelrc: ${{ inputs.architecture == 'arm64' && 'build --copt=-fno-gcse' || '' }}
 
     # Stages the binary into dist/, which is the build context below.
     - name: Build Typesense server
