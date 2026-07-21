@@ -1,7 +1,11 @@
 name: Typesense - MASTER Pipeline
 
-# Builds each commit on the default branch (v30, not master) and promotes it
+# Builds each commit on the default branch (v31, not master) and promotes it
 # into the staging registry.
+#
+# Not wildcarded, unlike the PR pipeline: staging-images:latest tracks one
+# release line, so only the current default branch should publish to it.
+# UPDATE THIS when the default branch moves to a new version.
 
 on:
   workflow_dispatch:
@@ -12,7 +16,7 @@ on:
         required: false
   push:
     branches:
-      - v30
+      - v31
 
 # Keyed per commit: GitHub keeps only one pending run per group, so a shared
 # group would drop queued commits and leave them with no staging image.

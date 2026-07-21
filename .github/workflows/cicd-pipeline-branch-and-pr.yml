@@ -8,8 +8,10 @@ on:
   merge_group:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    # Base branch. UPDATE THIS when the default branch moves to a new version —
+    # a mismatch creates no run at all, it does not show up as skipped.
     branches:
-      - v30
+      - v31
 
 concurrency:
   group: ci-pr-${{ github.ref }}
