@@ -1,0 +1,86 @@
+name: Typesense - MASTER Pipeline
+
+# Builds each commit on the default branch (v31, not master) and promotes it
+# into the staging registry.
+#
+# Not wildcarded, unlike the PR pipeline: staging-images:latest tracks one
+# release line, so only the current default branch should publish to it.
+# UPDATE THIS when the default branch moves to a new version.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to compile in, e.g. 30.0.0-ory.1-rc1 (default: commit SHA)'
+        type: string
+        required: false
+  push:
+    branches:
+      - v31
+
+# Keyed per commit: GitHub keeps only one pending run per group, so a shared
+# group would drop queued commits and leave them with no staging image.
+concurrency:
+  group: cicd-pipeline-master-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build-image:
+    name: Build typesense (dirty)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "${GITHUB_ENV}"
+      - name: Build Docker Image
+        uses: ./.github/actions/image-build
+        with:
+          image_repo: europe-west3-docker.pkg.dev/ory-artifacts/dirty-images
+          image_name: typesense
+          image_tag: ${{ github.sha }}
+          # Empty on a push event, so the action falls back to the commit SHA.
+          typesense_version: ${{ inputs.version }}
+          bazel_cache_key: ${{ vars.BAZEL_CACHE_KEY != '' && vars.BAZEL_CACHE_KEY || 'image-build' }}
+
+  docker-push:
+    name: Push Staging Image
+    needs:
+      - build-image
+    if: ${{ !failure() && !cancelled() && needs.build-image.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      IMAGE_REPO_SRC: 'europe-west3-docker.pkg.dev/ory-artifacts/dirty-images'
+      IMAGE_REPO_DST: 'europe-west3-docker.pkg.dev/ory-artifacts/staging-images'
+      REPO: europe-west3-docker.pkg.dev
+    steps:
+      # NOTE: this requires ory-corp/typesense to be added to the
+      # attributeCondition of the gha-artifact-promoter provider. Until that
+      # infrastructure change lands, this job fails at the auth step.
+      - name: Auth Cloud SDK
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ory-artifacts
+          workload_identity_provider: 'projects/54661938681/locations/global/workloadIdentityPools/gha-artifact-promoter/providers/github'
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3.0.1
+      - name: Log in to Artifact Registry
+        run: gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin "${REPO}"
+      # SHA-pinned: third-party action, runs with a registry token in reach.
+      - name: Push typesense image
+        uses: akhilerm/tag-push-action@eadeefebd39db8a47e146115649adae1fce576a6 # v2.3.0
+        env:
+          IMAGE_NAME: 'typesense'
+        with:
+          src: ${{ env.IMAGE_REPO_SRC }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          dst: |
+            ${{ env.IMAGE_REPO_DST }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_REPO_DST }}/${{ env.IMAGE_NAME }}:latest

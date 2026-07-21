@@ -1,0 +1,68 @@
+name: Typesense - Branch and PR Pipeline
+
+# Builds a dirty image for every non-draft PR. No push trigger on purpose:
+# it would double every expensive Bazel build.
+
+on:
+  workflow_dispatch:
+  merge_group:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # Base branch. UPDATE THIS when the default branch moves to a new version —
+    # a mismatch creates no run at all, it does not show up as skipped.
+    branches:
+      - v31
+
+concurrency:
+  group: ci-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-image:
+    name: Build typesense (dirty)
+    # Skip drafts (multi-hour build) and PRs from external forks (no OIDC token,
+    # nowhere to push; tests.yml still covers them).
+    #
+    # Compare head repo to base repo — do NOT use head.repo.fork, which is true
+    # for every PR here because this repo is itself a fork of typesense/typesense.
+    if: ${{ github.event.pull_request.draft != true &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-22.04
+    # Cold Bazel cache runs well over an hour.
+    timeout-minutes: 180
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      IMAGE_REPO: europe-west3-docker.pkg.dev/ory-artifacts/dirty-images
+    steps:
+      # Pinned to the PR head, not the default refs/pull/N/merge commit, so the
+      # image tag names a commit that actually exists on the branch.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "${GITHUB_ENV}"
+      - name: Build Docker Image
+        uses: ./.github/actions/image-build
+        with:
+          image_repo: ${{ env.IMAGE_REPO }}
+          image_name: typesense
+          image_tag: ${{ github.event.pull_request.head.sha || github.sha }}
+          image_tag_alt: ${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || '' }}
+          bazel_cache_key: ${{ vars.BAZEL_CACHE_KEY != '' && vars.BAZEL_CACHE_KEY || 'image-build' }}
+      - name: Summary
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          IMAGE_TAG: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          {
+            echo "### Typesense image pushed"
+            echo
+            echo '```'
+            echo "${IMAGE_REPO}/typesense:${IMAGE_TAG}"
+            if [ -n "${PR_NUMBER}" ]; then
+              echo "${IMAGE_REPO}/typesense:pr-${PR_NUMBER}"
+            fi
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
