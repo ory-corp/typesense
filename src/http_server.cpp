@@ -19,7 +19,7 @@
 // The message dispatcher of the event loop the current thread runs. Set by each loop thread on
 // startup; read in catch_all_handler to tag every request with its owning loop, so that its
 // response is delivered back on that same loop.
-thread_local http_message_dispatcher* tls_res_dispatcher = nullptr;
+static thread_local http_message_dispatcher* tls_res_dispatcher = nullptr;
 
 HttpServer::HttpServer(const std::string & version, const std::string & listen_address,
                        uint32_t listen_port, const std::string & ssl_cert_path, const std::string & ssl_cert_key_path,
@@ -71,7 +71,12 @@ HttpServer::HttpServer(const std::string & version, const std::string & listen_a
 
 void HttpServer::on_accept(h2o_socket_t *listener, const char *err) {
     // listener->data is the accept context of the event loop that owns this listener, so that the
-    // connection is handled entirely on that loop.
+    // connection is handled entirely on that loop. All loops poll dup()s of one listening socket,
+    // so they race accept() on a shared queue: losing the race yields NULL (EAGAIN), and while
+    // connections remain queued the level-triggered evloop fires this callback again.
+    // Deliberately accepts one connection per wakeup (h2o's own server batches up to 10):
+    // returning to the poll loop between accepts gives the other loops a chance to win the next
+    // connection, spreading load across loops at the cost of extra wakeups.
     h2o_accept_ctx_t* accept_ctx = reinterpret_cast<h2o_accept_ctx_t*>(listener->data);
     h2o_socket_t *sock;
 
@@ -161,7 +166,7 @@ int HttpServer::setup_ssl(ev_loop_t* loop) {
 int HttpServer::bind_listen_fd() {
     struct addrinfo hints;
     struct addrinfo *result, *rp;
-    int fd = -1, reuseaddr_flag = 1, reuseport_flag = 1;
+    int fd = -1, reuseaddr_flag = 1;
     std::string port_str = std::to_string(listen_port);
 
     std::string actual_address = listen_address;
@@ -212,20 +217,16 @@ int HttpServer::bind_listen_fd() {
             LOG(WARNING) << "Failed to set SO_REUSEADDR";
         }
 
-        // SO_REUSEPORT lets each HTTP event loop bind its own listener on the same port; the
-        // kernel load-balances incoming connections across them.
-        if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuseport_flag, sizeof(reuseport_flag)) != 0) {
-            LOG(WARNING) << "Failed to set SO_REUSEPORT";
-        }
-
         if (bind(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
             // Successfully bound
             break;
         }
 
-        // Log the specific bind error to help with debugging
+        // Log the specific bind error to help with debugging. errno must be captured before
+        // LOG(): the LogMessage constructor runs first and can clobber it.
+        const int bind_errno = errno;
         LOG(WARNING) << "Failed to bind to address (family=" << rp->ai_family
-                    << "): " << strerror(errno);
+                    << "): " << strerror(bind_errno);
         close(fd);
     }
 
@@ -245,12 +246,7 @@ int HttpServer::bind_listen_fd() {
     return fd;
 }
 
-int HttpServer::create_listener(ev_loop_t* loop) {
-    int fd = bind_listen_fd();
-    if(fd < 0) {
-        return -1;
-    }
-
+int HttpServer::create_listener(ev_loop_t* loop, int fd) {
     if(!ssl_cert_path.empty() && !ssl_cert_key_path.empty()) {
         int ssl_setup_code = setup_ssl(loop);
         if(ssl_setup_code != 0) {
@@ -282,14 +278,31 @@ int HttpServer::run(ReplicationState* replication_state) {
     h2o_timer_init(&metrics_refresh_timer.timer, on_metrics_refresh_timeout);
     h2o_timer_link(loops[0]->ctx.loop, AppMetrics::METRICS_REFRESH_INTERVAL_MS, &metrics_refresh_timer.timer);
 
+    // One socket is bound to the port; every loop accepts from it via its own dup()'d fd. Idle
+    // loops win the accept race, so load follows capacity, and a second process binding the same
+    // port still fails with EADDRINUSE (unlike SO_REUSEPORT, which would silently split traffic).
+    int listen_fd = bind_listen_fd();
+    if(listen_fd < 0) {
+        // bind_listen_fd has already logged the specific cause
+        LOG(ERROR) << "Failed to listen on " << listen_address << ":" << listen_port;
+        return 1;
+    }
+
     for(ev_loop_t* loop : loops) {
         // every dispatcher gets the full set of registered message handlers (registration
         // happens before run(), so a plain copy is safe)
         loop->dispatcher->message_handlers = message_handlers;
         loop->dispatcher->on(STOP_SERVER_MESSAGE, HttpServer::on_stop_server);
 
-        if(create_listener(loop) != 0) {
-            LOG(ERROR) << "Failed to listen on " << listen_address << ":" << listen_port << " - " << strerror(errno);
+        int fd = (loop->index == 0) ? listen_fd : dup(listen_fd);
+        if(fd == -1) {
+            const int dup_errno = errno;  // capture before LOG() can clobber it
+            LOG(ERROR) << "Failed to dup listener fd - " << strerror(dup_errno);
+            return 1;
+        }
+
+        if(create_listener(loop, fd) != 0) {
+            LOG(ERROR) << "Failed to set up listener on " << listen_address << ":" << listen_port;
             return 1;
         }
     }
