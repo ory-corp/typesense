@@ -127,8 +127,9 @@ private:
     h2o_compress_args_t compress_args;
     h2o_hostconf_t *hostconf;
 
-    // One HTTP event loop: h2o context, accept context, listener (SO_REUSEPORT) and message
-    // dispatcher. Loop 0 runs on the thread that calls run(), the others on their own threads.
+    // One HTTP event loop: h2o context, accept context, listener (a dup() of the shared listening
+    // socket) and message dispatcher. Loop 0 runs on the thread that calls run(), the others on
+    // their own threads.
     // Each connection is owned by exactly one loop: it is accepted, read and written only there,
     // and responses are delivered through the loop's dispatcher (http_req::res_dispatcher).
     // Every loop refreshes its own SSL context so that no SSL state is shared across threads.
@@ -203,12 +204,16 @@ private:
 
     static void on_metrics_refresh_timeout(h2o_timer_t *entry);
 
-    // Binds + listens a SO_REUSEPORT socket on (listen_address, listen_port), returning the fd
-    // (or -1). Each event loop registers its own listener on its own fd and the kernel
-    // load-balances incoming connections across them.
+    // Binds + listens a single socket on (listen_address, listen_port), returning the fd (or -1).
+    // Every event loop polls its own dup() of this fd — one shared kernel accept queue — and
+    // races non-blocking accepts; the level-triggered evloop keeps waking loops while connections
+    // are pending. This is the same model h2o's own server uses by default (dup_listener in
+    // h2o's src/main.c).
     int bind_listen_fd();
 
-    int create_listener(ev_loop_t* loop);
+    // Wraps `fd` (the listen fd or a dup of it) into `loop`'s h2o socket and starts accepting.
+    // `loop` owns `fd` from here on: it is closed on shutdown by the loop (or here, on failure).
+    int create_listener(ev_loop_t* loop, int fd);
 
     // Runs `loop` until stop() is called; the loop closes its own listener on the way out.
     void loop_run(ev_loop_t* loop);
