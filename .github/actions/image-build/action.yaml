@@ -1,7 +1,9 @@
 name: 'Build Typesense docker image'
 description: >-
-  Builds typesense-server with Bazel and pushes the deployment image to an Ory
-  Artifact Registry repository via Workload Identity Federation.
+  Builds typesense-server with Bazel natively for one architecture and pushes
+  an arch-suffixed image (:TAG-amd64 / :TAG-arm64) to an Ory Artifact Registry
+  repository via Workload Identity Federation. Combine the per-arch tags into
+  one multi-platform manifest list with the image-merge action.
 
 inputs:
   image_repo:
@@ -14,17 +16,18 @@ inputs:
     description: name of the docker image
   image_tag:
     required: false
-    description: tag of the docker image, defaults to the commit SHA
-  image_tag_alt:
-    required: false
-    description: additional tag, e.g. pr-1234
+    description: >-
+      tag of the docker image before the architecture suffix, defaults to the
+      commit SHA. The image is pushed as :TAG-ARCHITECTURE.
   typesense_version:
     required: false
     description: version compiled into the binary and reported by /debug, defaults to the short commit SHA
   architecture:
     required: false
     default: 'amd64'
-    description: target architecture, single native arch only
+    description: >-
+      target architecture. Must match the runner's native CPU: the Bazel build
+      is not cross-compiled. Also suffixes the pushed tag and the Bazel caches.
   bazel_jobs:
     required: false
     default: '6'
@@ -39,11 +42,11 @@ inputs:
 
 outputs:
   digest:
-    description: digest of the pushed image, safe to hand to a later job
+    description: digest of the pushed single-arch image
     value: ${{ steps.build.outputs.digest }}
   image_tag:
-    description: the tag the image was pushed under
-    value: ${{ steps.parse-inputs.outputs.tag }}
+    description: the arch-suffixed tag the image was pushed under
+    value: ${{ steps.parse-inputs.outputs.arch_tag }}
   version:
     description: the version compiled into the binary
     value: ${{ steps.parse-inputs.outputs.version }}
@@ -58,8 +61,8 @@ runs:
       # shell metacharacters cannot alter the script.
       env:
         INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
-        INPUT_IMAGE_TAG_ALT: ${{ inputs.image_tag_alt }}
         INPUT_TYPESENSE_VERSION: ${{ inputs.typesense_version }}
+        INPUT_ARCHITECTURE: ${{ inputs.architecture }}
         COMMIT_SHA: ${{ github.sha }}
       run: |
         # Docker tag grammar: may not start with '.' or '-'; '_' is allowed.
@@ -77,11 +80,14 @@ runs:
         fi
         # Validated up front so a bad tag fails now, not after the Bazel build.
         check_tag "image_tag" "${tag}"
-        if [ -n "${INPUT_IMAGE_TAG_ALT}" ]; then
-          check_tag "image_tag_alt" "${INPUT_IMAGE_TAG_ALT}"
-        fi
         echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
-        echo "Image tag is set to ${tag}"
+
+        # The pushed tag carries the arch suffix; the image-merge action later
+        # combines the per-arch tags under the plain tag.
+        check_tag "architecture" "${INPUT_ARCHITECTURE}"
+        check_tag "arch_tag" "${tag}-${INPUT_ARCHITECTURE}"
+        echo "arch_tag=${tag}-${INPUT_ARCHITECTURE}" >> "${GITHUB_OUTPUT}"
+        echo "Image tag is set to ${tag}-${INPUT_ARCHITECTURE}"
 
         # Derived from the tag, not HEAD: on pull_request, HEAD is the ephemeral
         # refs/pull/N/merge commit, which exists in no branch.
@@ -120,10 +126,19 @@ runs:
     - name: Set up Bazel
       uses: bazel-contrib/setup-bazel@0.14.0
       with:
+        # setup-bazel's cache keys include the OS but not the CPU arch, and
+        # GitHub cache keys are immutable: without this split the first arch to
+        # save would own the key and the other arch would stay cold forever.
+        cache-version: 1-${{ inputs.architecture }}
         bazelisk-cache: true
         disk-cache: ${{ inputs.bazel_cache_key }}
         repository-cache: true
         external-cache: true
+        # GCC 10.5's GCSE pass miscompiles nlohmann's dump_integer on aarch64,
+        # corrupting integers in serialized JSON. Injected via the user-level
+        # bazelrc (picked up by every bazel invocation in ci_build_v2.sh) so
+        # that script stays identical to upstream.
+        bazelrc: ${{ inputs.architecture == 'arm64' && 'build --copt=-fno-gcse' || '' }}
 
     # Stages the binary into dist/, which is the build context below.
     - name: Build Typesense server
@@ -151,14 +166,6 @@ runs:
       shell: bash
       run: gcloud auth configure-docker europe-west3-docker.pkg.dev --quiet
 
-    # No Docker Hub credentials here, so binfmt/buildkit come from the cache
-    # repo. Keep these in sync with the pinned actions' own defaults.
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@v4
-      with:
-        # renovate: datasource=docker depName=europe-west3-docker.pkg.dev/ory-artifacts/cache-docker-hub/tonistiigi/binfmt
-        image: europe-west3-docker.pkg.dev/ory-artifacts/cache-docker-hub/tonistiigi/binfmt:latest@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
-
     # Mirrors route base image pulls through Artifact Registry. If a mirror is
     # down, BuildKit falls back to anonymous rate-limited upstream pulls.
     - name: Set up Docker Buildx
@@ -181,22 +188,16 @@ runs:
         context: dist
         file: docker/deployment.Dockerfile
         platforms: linux/${{ inputs.architecture }}
+        # A plain image manifest per arch (no provenance attestation index)
+        # keeps the merged manifest list a clean one-entry-per-platform index.
+        provenance: false
         push: true
         tags: |
-          ${{ inputs.image_repo }}/${{ inputs.image_name }}:${{ steps.parse-inputs.outputs.tag }}
+          ${{ inputs.image_repo }}/${{ inputs.image_name }}:${{ steps.parse-inputs.outputs.arch_tag }}
         labels: |
           org.opencontainers.image.version=${{ steps.parse-inputs.outputs.version }}
           org.opencontainers.image.revision=${{ github.sha }}
           org.opencontainers.image.source=https://github.com/${{ github.repository }}
-
-    # imagetools copies the manifest, so this works for multi-arch too.
-    - name: Tag alternative image tag
-      if: ${{ inputs.image_tag_alt != '' }}
-      shell: bash
-      env:
-        IMAGE: ${{ inputs.image_repo }}/${{ inputs.image_name }}:${{ steps.parse-inputs.outputs.tag }}
-        IMAGE_ALT: ${{ inputs.image_repo }}/${{ inputs.image_name }}:${{ inputs.image_tag_alt }}
-      run: docker buildx imagetools create --tag "${IMAGE_ALT}" "${IMAGE}"
 
     # TODO(security): scan the image here before it can be promoted.
     # Follow-up to ory-corp/infrastructure#6496.

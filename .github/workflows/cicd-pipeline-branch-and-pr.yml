@@ -1,7 +1,7 @@
 name: Typesense - Branch and PR Pipeline
 
-# Builds a dirty image for every non-draft PR. No push trigger on purpose:
-# it would double every expensive Bazel build.
+# Builds a dirty multi-platform image for every non-draft PR. No push trigger
+# on purpose: it would double every expensive Bazel build.
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   build-image:
-    name: Build typesense (dirty)
+    name: Build typesense (dirty, ${{ matrix.arch }})
     # Skip drafts (multi-hour build) and PRs from external forks (no OIDC token,
     # nowhere to push; tests.yml still covers them).
     #
@@ -27,7 +27,14 @@ jobs:
     # for every PR here because this repo is itself a fork of typesense/typesense.
     if: ${{ github.event.pull_request.draft != true &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
     # Cold Bazel cache runs well over an hour.
     timeout-minutes: 180
     permissions:
@@ -49,15 +56,41 @@ jobs:
           image_repo: ${{ env.IMAGE_REPO }}
           image_name: typesense
           image_tag: ${{ github.event.pull_request.head.sha || github.sha }}
-          image_tag_alt: ${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || '' }}
+          architecture: ${{ matrix.arch }}
           bazel_cache_key: ${{ vars.BAZEL_CACHE_KEY != '' && vars.BAZEL_CACHE_KEY || 'image-build' }}
+
+  merge-image:
+    name: Merge multi-arch image
+    # Skipped automatically when build-image is skipped.
+    needs:
+      - build-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      IMAGE_REPO: europe-west3-docker.pkg.dev/ory-artifacts/dirty-images
+    steps:
+      # Same ref as the build jobs, so the merge uses the PR's action version.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Merge per-arch images
+        uses: ./.github/actions/image-merge
+        with:
+          image_repo: ${{ env.IMAGE_REPO }}
+          image_name: typesense
+          image_tag: ${{ github.event.pull_request.head.sha || github.sha }}
+          image_tag_alt: ${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || '' }}
       - name: Summary
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           IMAGE_TAG: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           {
-            echo "### Typesense image pushed"
+            echo "### Typesense multi-arch image pushed (amd64 + arm64)"
             echo
             echo '```'
             echo "${IMAGE_REPO}/typesense:${IMAGE_TAG}"

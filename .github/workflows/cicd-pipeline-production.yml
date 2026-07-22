@@ -10,10 +10,11 @@ name: Typesense - PRODUCTION Pipeline
 # Prefer promote; build only when production must report a specific version
 # the staging image does not already carry.
 #
-# Build mode needs two jobs because the registries have different writers:
-# only gha-artifact-promoter can write production-images, but only
-# gha-artifact-writer can read the cache-* mirrors the build pulls from.
-# So the build lands in dirty-images and the second job copies it across.
+# Build mode needs separate build/publish jobs because the registries have
+# different writers: only gha-artifact-promoter can write production-images,
+# but only gha-artifact-writer can read the cache-* mirrors the build pulls
+# from. So the per-arch builds and the manifest merge land in dirty-images and
+# the final job copies the result across.
 #
 # Both modes copy by digest, so the source tag cannot be swapped underneath.
 
@@ -39,16 +40,21 @@ concurrency:
 
 jobs:
   build-image:
-    name: Build typesense ${{ inputs.version }}
+    name: Build typesense ${{ inputs.version }} (${{ matrix.arch }})
     # Skipped entirely in promote mode.
     if: ${{ inputs.version != '' }}
-    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     permissions:
       id-token: write
       contents: read
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -56,22 +62,45 @@ jobs:
           ref: ${{ inputs.commit }}
       - run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "${GITHUB_ENV}"
       - name: Build Docker Image
-        id: build
         uses: ./.github/actions/image-build
         with:
           image_repo: europe-west3-docker.pkg.dev/ory-artifacts/dirty-images
           image_name: typesense
           # Namespaced so it cannot collide with PR builds' commit-SHA tags.
           image_tag: release-${{ inputs.version }}
+          architecture: ${{ matrix.arch }}
           typesense_version: ${{ inputs.version }}
           bazel_cache_key: ${{ vars.BAZEL_CACHE_KEY != '' && vars.BAZEL_CACHE_KEY || 'image-build' }}
+
+  merge-image:
+    name: Merge multi-arch image
+    # Skipped automatically in promote mode, because build-image is skipped.
+    needs:
+      - build-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      digest: ${{ steps.merge.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Merge per-arch images
+        id: merge
+        uses: ./.github/actions/image-merge
+        with:
+          image_repo: europe-west3-docker.pkg.dev/ory-artifacts/dirty-images
+          image_name: typesense
+          image_tag: release-${{ inputs.version }}
 
   push-production:
     name: Publish to production
     needs:
-      - build-image
-    # build-image is skipped in promote mode, which must not block this job.
-    if: ${{ !cancelled() && (needs.build-image.result == 'success' || needs.build-image.result == 'skipped') }}
+      - merge-image
+    # merge-image is skipped in promote mode, which must not block this job.
+    if: ${{ !cancelled() && (needs.merge-image.result == 'success' || needs.merge-image.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     # Gates nothing until protection rules are attached in repo settings.
@@ -87,7 +116,7 @@ jobs:
       IMAGE_NAME: 'typesense'
       VERSION: ${{ inputs.version }}
       COMMIT: ${{ inputs.commit }}
-      BUILD_DIGEST: ${{ needs.build-image.outputs.digest }}
+      BUILD_DIGEST: ${{ needs.merge-image.outputs.digest }}
     steps:
       # NOTE: this requires ory-corp/typesense to be added to the
       # attributeCondition of the gha-artifact-promoter provider. Until that
@@ -104,6 +133,8 @@ jobs:
         run: gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin "${REPO}"
 
       # Collapse both modes to one digest-pinned ref so the publish steps match.
+      # The digest names the multi-arch manifest list, so every copy below
+      # carries both platforms.
       - name: Resolve source image
         id: src
         run: |
