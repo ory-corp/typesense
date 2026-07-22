@@ -74,9 +74,11 @@ jobs:
 
   merge-image:
     name: Merge multi-arch image
-    # Skipped automatically in promote mode, because build-image is skipped.
     needs:
       - build-image
+    # Skips in promote mode (build-image skipped, so result != success) and on a
+    # failed build. Explicit rather than relying on the implicit success().
+    if: ${{ !cancelled() && needs.build-image.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -98,9 +100,17 @@ jobs:
   push-production:
     name: Publish to production
     needs:
+      - build-image
       - merge-image
-    # merge-image is skipped in promote mode, which must not block this job.
-    if: ${{ !cancelled() && (needs.merge-image.result == 'success' || needs.merge-image.result == 'skipped') }}
+    # Accepting a bare 'skipped' from merge-image conflated two very different
+    # states: promote mode (nothing to build) and a build that failed. The
+    # latter used to reach this job, consume the production approval, and only
+    # then die on the empty digest. Promote mode requires both upstreams to be
+    # skipped-not-failed; build mode requires merge-image to have succeeded.
+    if: ${{ !cancelled()
+      && needs.build-image.result != 'failure'
+      && needs.merge-image.result != 'failure'
+      && (inputs.version == '' || needs.merge-image.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     # Gates nothing until protection rules are attached in repo settings.
@@ -118,9 +128,6 @@ jobs:
       COMMIT: ${{ inputs.commit }}
       BUILD_DIGEST: ${{ needs.merge-image.outputs.digest }}
     steps:
-      # NOTE: this requires ory-corp/typesense to be added to the
-      # attributeCondition of the gha-artifact-promoter provider. Until that
-      # infrastructure change lands, this job fails at the auth step.
       - name: Auth Cloud SDK
         id: auth
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
