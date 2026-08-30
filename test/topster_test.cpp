@@ -3,6 +3,7 @@
 #include "topster.h"
 #include "match_score.h"
 #include <fstream>
+#include <unordered_set>
 
 TEST(TopsterTest, MaxIntValues) {
     Topster<KV> topster(5);
@@ -260,4 +261,25 @@ TEST(TopsterTest, DistinctIntValues) {
 
     ASSERT_TRUE(dist_topster_first_pass.group_kv_map.empty());
     ASSERT_EQ(10, dist_topster_first_pass.loglog_counter->cardinality());
+}
+
+TEST(TopsterTest, UnionKVKeyIsUniquePerDocument) {
+    // Every collection numbers its documents from 0, so a union sees the same sequence ids from
+    // every collection and search. The keys must still tell all of them apart.
+    int64_t scores[3] = {0, 0, 0};
+    std::unordered_set<uint64_t> collection_keys, search_keys;
+    const uint32_t ids = 32, seq_ids = 4096;
+
+    for(uint32_t id = 0; id < ids; id++) {
+        for(uint32_t seq_id = 0; seq_id < seq_ids; seq_id++) {
+            KV kv(0, seq_id, seq_id, 0, scores);
+            Union_KV by_collection(kv, id, id, true);
+            Union_KV by_search(kv, id, id, false);
+            collection_keys.insert(Union_KV::get_key(&by_collection));
+            search_keys.insert(Union_KV::get_key(&by_search));
+        }
+    }
+
+    ASSERT_EQ(ids * seq_ids, collection_keys.size());
+    ASSERT_EQ(ids * seq_ids, search_keys.size());
 }
