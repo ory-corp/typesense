@@ -6411,6 +6411,17 @@ Option<bool> Index::do_infix_search(const size_t num_search_fields, const std::v
 
                     filtered_infix_ids = std::move(result);
                     filter_result_iterator->reset();
+                } else if(filter_result_iterator->is_filter_provided()) {
+                    // These matches have not been intersected with filter_by:
+                    // the iterator is either exhausted or out of the search's
+                    // time budget. Dropping them keeps a cut-off result set a
+                    // subset of the complete one, which is what every other
+                    // phase of the search does when the budget runs out.
+                    if(raw_infix_ids == &infix_ids[0]) {
+                        // Borrowed from infix_ids, which owns it.
+                        raw_infix_ids = nullptr;
+                    }
+                    continue;
                 }
 
                 bool field_is_array = search_schema.at(the_fields[field_id].name).is_array();

@@ -375,6 +375,37 @@ protected:
         }
     }
 
+    // Enough documents for the filter iterator to observe the deadline: it
+    // reads the clock every function_call_modulo calls, so a handful of
+    // documents finish before a spent budget is ever noticed.
+    static constexpr int DOCS_PER_COLLECTION = 200;
+
+    // Two collections whose every document matches the query through the infix
+    // index, so what a search returns is decided by filter_by alone.
+    void setupInfixCollections() {
+        for (const auto& name: {"infix_0", "infix_1"}) {
+            nlohmann::json schema_json = {
+                    {"name",   name},
+                    {"fields", {{{"name", "title"},    {"type", "string"}, {"infix", true}},
+                                {{"name", "category"}, {"type", "string"}}}}
+            };
+            auto collection_create_op = collectionManager.create_collection(schema_json);
+            ASSERT_TRUE(collection_create_op.ok());
+
+            auto collection = collection_create_op.get();
+            for (auto i = 0; i < DOCS_PER_COLLECTION; i++) {
+                nlohmann::json document = {
+                        // "stock" is reachable as an infix of this token and
+                        // not as a token of its own, so the query is answered
+                        // by the infix index alone.
+                        {"title",    "restocked" + std::to_string(i)},
+                        {"category", i % 2 == 0 ? "kitchen" : "garden"}
+                };
+                ASSERT_TRUE(collection->add(document.dump()).ok());
+            }
+        }
+    }
+
     virtual void SetUp() {
         setupCollection();
     }
@@ -3009,4 +3040,65 @@ TEST_F(UnionTest, CuratedHitShouldNotSuppressUnrelatedRawHit) {
     ASSERT_EQ(200, json_res["hits"].size());
     ASSERT_EQ("99", json_res["hits"][0]["document"]["id"]);
     ASSERT_TRUE(json_res["hits"][0]["curated"].get<bool>());
+}
+
+// A search that runs out of its time budget returns fewer results than a
+// complete one. It must not return different ones: filter_by decides what a
+// result set may contain, so a cut-off result set is a subset of the complete
+// one and never a superset.
+//
+// A union shares one time budget across its sub-searches — they are given the
+// same start timestamp, so each one begins with less of it left than the one
+// before. A start timestamp in the past puts a sub-search in that state without
+// having to index enough documents to spend a real budget first.
+TEST_F(UnionTest, SearchCutoffKeepsFilterApplied) {
+    setupInfixCollections();
+
+    searches = R"([
+                    {
+                        "collection": "infix_0",
+                        "q": "stock",
+                        "query_by": "title",
+                        "infix": "always",
+                        "filter_by": "category:=kitchen"
+                    },
+                    {
+                        "collection": "infix_1",
+                        "q": "stock",
+                        "query_by": "title",
+                        "infix": "always",
+                        "filter_by": "category:=kitchen"
+                    }
+                ])"_json;
+    embedded_params = std::vector<nlohmann::json>(2, nlohmann::json::object());
+
+    auto assert_only_kitchen = [&](const std::string& what) {
+        ASSERT_LE(json_res.value("found", 0u), (size_t) DOCS_PER_COLLECTION)
+                            << what << ": found more than filter_by admits";
+        for (const auto& hit: json_res.value("hits", nlohmann::json::array())) {
+            ASSERT_EQ("kitchen", hit["document"]["category"].get<std::string>()) << what;
+        }
+    };
+
+    // With the budget intact, the filter admits half of each collection.
+    req_params = {{"per_page", "20"}, {"infix", "always"}};
+    auto search_op = collectionManager.do_union(req_params, embedded_params, searches, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+    ASSERT_FALSE(json_res["search_cutoff"].get<bool>());
+    ASSERT_EQ(DOCS_PER_COLLECTION, json_res["found"]);
+    assert_only_kitchen("a complete search");
+    json_res.clear();
+    req_params.clear();
+
+    // The same search, begun with the budget already spent. A union that spends
+    // it before producing a hit answers with no result body at all, so the
+    // assertions read what is there rather than requiring it.
+    req_params = {{"per_page", "20"}, {"infix", "always"}, {"search_cutoff_ms", "1"}};
+    search_op = collectionManager.do_union(req_params, embedded_params, searches, json_res,
+                                           now_ts - std::chrono::microseconds(std::chrono::seconds(1)).count());
+    ASSERT_TRUE(search_op.ok());
+    ASSERT_LT(json_res.value("found", 0u), (size_t) DOCS_PER_COLLECTION)
+                        << "the search returned as much as a complete one, so it did not run out of budget "
+                           "and this asserts nothing";
+    assert_only_kitchen("a cut-off search");
 }
