@@ -6224,7 +6224,16 @@ Option<bool> Index::do_phrase_search(const size_t num_search_fields, const std::
     // AND phrase id matches with filter ids
     if(filter_result_iterator->validity) {
         filter_result_iterator_t::add_phrase_ids(filter_result_iterator, phrase_result_ids, phrase_result_count);
+    } else if(filter_result_iterator->is_filter_provided()) {
+        // `filter_by` was provided and matched no document, which is why the iterator is not valid. The phrase
+        // matches have not been intersected with it, so none of them may be returned: replacing the iterator below
+        // would drop `filter_by` from the search and admit every one of them. The search still has to run, since a
+        // curated hit is returned whether or not it matches `filter_by`.
+        delete [] phrase_result_ids;
+        phrase_result_ids = nullptr;
+        phrase_result_count = 0;
     } else {
+        // No `filter_by` was provided, so the phrase matches themselves become the filter.
         delete filter_result_iterator;
         filter_result_iterator = new filter_result_iterator_t(phrase_result_ids, phrase_result_count);
     }

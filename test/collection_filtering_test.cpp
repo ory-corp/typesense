@@ -5444,3 +5444,109 @@ TEST_F(CollectionFilteringTest, MissingFilterLazyEvaluationSearchHits) {
 
     collectionManager.drop_collection("products");
 }
+
+// `filter_by` decides what a search may return, and a phrase query is no
+// exception. `Index::do_phrase_search` makes the phrase matches the filter when
+// the filter iterator is not valid. That is right when no `filter_by` was
+// given, since an absent filter leaves the iterator invalid too, and it would
+// drop `filter_by` from the search if one was given and matched no document —
+// the same conflation `Index::do_infix_search` tells apart with
+// `is_filter_provided()`.
+//
+// `Index::search` returns early when `filter_by` matches nothing, so this is
+// only reachable while something is curated: a pinned or a hidden hit puts an
+// id in `curated_ids` and the search runs on. The tests below cover each
+// surface the phrase matches would otherwise reach — the hits, `found`, the
+// facet counts and the groups. None of them needs an infix field, a time
+// budget or a union.
+class PhraseSearchFilterTest : public CollectionFilteringTest {
+protected:
+    // Twelve documents whose titles all contain the phrase "in stock", half of
+    // them `kitchen` and half `garden`. `category:=nothing` matches none.
+    void setupPhraseCollection() {
+        nlohmann::json schema_json = R"({
+                "name": "phrase_filter",
+                "fields": [
+                    {"name": "title", "type": "string"},
+                    {"name": "category", "type": "string", "facet": true}
+                ]
+            })"_json;
+        auto collection_create_op = collectionManager.create_collection(schema_json);
+        ASSERT_TRUE(collection_create_op.ok()) << collection_create_op.error();
+
+        auto collection = collection_create_op.get();
+        for (auto i = 0; i < 12; i++) {
+            nlohmann::json document = {{"title",    "in stock item" + std::to_string(i)},
+                                       {"category", i % 2 == 0 ? "kitchen" : "garden"}};
+            ASSERT_TRUE(collection->add(document.dump()).ok());
+        }
+    }
+
+    nlohmann::json search(std::map<std::string, std::string> params) {
+        nlohmann::json embedded_params = nlohmann::json::object();
+        std::string results_json_str;
+        params.insert({{"collection", "phrase_filter"}, {"query_by", "title"},
+                       {"q", "\"in stock\""}, {"filter_by", "category:=nothing"}});
+        auto search_op = CollectionManager::do_search(params, embedded_params, results_json_str, 0);
+        EXPECT_TRUE(search_op.ok()) << search_op.error();
+        return search_op.ok() ? nlohmann::json::parse(results_json_str) : nlohmann::json::object();
+    }
+};
+
+// A pinned hit is returned whether or not it matches `filter_by`, and it is the
+// only document such a search may return.
+TEST_F(PhraseSearchFilterTest, PinnedHitDoesNotAdmitTheRestOfThePhraseMatches) {
+    setupPhraseCollection();
+
+    auto res = search({{"pinned_hits", "5:1"}});
+
+    ASSERT_EQ(1, res["found"].get<size_t>());
+    ASSERT_EQ(1, res["hits"].size());
+    ASSERT_EQ("5", res["hits"][0]["document"]["id"].get<std::string>());
+}
+
+// A hidden hit adds no document of its own, so this search may return none.
+TEST_F(PhraseSearchFilterTest, HiddenHitDoesNotAdmitThePhraseMatches) {
+    setupPhraseCollection();
+
+    auto res = search({{"hidden_hits", "7"}});
+
+    ASSERT_EQ(0, res["found"].get<size_t>());
+    ASSERT_EQ(0, res["hits"].size());
+}
+
+// The facet counts are computed over the same result id set, so they report the
+// documents `filter_by` excludes even at `per_page=0`, where no hit is returned
+// to show them.
+TEST_F(PhraseSearchFilterTest, FacetCountsDoNotCountTheExcludedPhraseMatches) {
+    setupPhraseCollection();
+
+    auto res = search({{"pinned_hits", "5:1"}, {"facet_by", "category"}, {"per_page", "0"}});
+
+    EXPECT_EQ(1, res["found"].get<size_t>());
+    for (const auto& facet: res["facet_counts"]) {
+        for (const auto& count: facet["counts"]) {
+            // The pinned document is the only one that may be counted, and it
+            // is a `garden` one.
+            EXPECT_NE("kitchen", count["value"].get<std::string>())
+                                << "a kitchen document reached the facet counts: " << count.dump();
+        }
+    }
+}
+
+// Grouping reads the same result set: every document behind a group is one the
+// search returned.
+TEST_F(PhraseSearchFilterTest, GroupedHitsDoNotIncludeTheExcludedPhraseMatches) {
+    setupPhraseCollection();
+
+    auto res = search({{"pinned_hits", "5:1"}, {"group_by", "category"}});
+
+    std::vector<std::string> ids;
+    for (const auto& group: res["grouped_hits"]) {
+        for (const auto& hit: group["hits"]) {
+            ids.push_back(hit["document"]["id"].get<std::string>());
+        }
+    }
+
+    ASSERT_EQ(std::vector<std::string>{"5"}, ids);
+}
