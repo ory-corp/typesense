@@ -86,6 +86,12 @@ jobs:
     needs: test
     runs-on: ubuntu-22.04
 
+    # The secrets context is not available in step-level `if` expressions, so
+    # whether this repository has the API keys is decided here and tested as a
+    # string below.
+    env:
+      HAS_API_SECRETS: ${{ secrets.OPENAI_API_KEY != '' }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -207,7 +213,7 @@ jobs:
           tar -xzf ./artifacts/v29.tar.gz -C ./artifacts/v29/
 
       - name: Run API tests with secrets
-        if: github.event.pull_request.head.repo.fork == false
+        if: github.event.pull_request.head.repo.fork == false && env.HAS_API_SECRETS == 'true'
         working-directory: api_tests
         env:
           TYPESENSE_BINARY_PATH: ${{ github.workspace }}/typesense-server-binary/typesense-server
@@ -219,7 +225,7 @@ jobs:
         run: typesense-api-tests
 
       - name: Run API tests without secrets
-        if: github.event.pull_request.head.repo.fork == true
+        if: github.event.pull_request.head.repo.fork == true || env.HAS_API_SECRETS != 'true'
         working-directory: api_tests
         env:
           TYPESENSE_BINARY_PATH: ${{ github.workspace }}/typesense-server-binary/typesense-server
