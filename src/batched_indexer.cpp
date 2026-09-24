@@ -89,7 +89,20 @@ void BatchedIndexer::enqueue(const std::shared_ptr<http_req>& req, const std::sh
 
     //LOG(INFO) << "request_chunk_key: " << req->start_ts << "_" << chunk_sequence << ", req body: " << req->body;
 
-    store->insert(request_chunk_key, req->to_json());
+    const bool persisted = store->insert(request_chunk_key, req->to_json());
+    if(!persisted && config.get_standalone()) {
+        LOG(ERROR) << "Failed to persist standalone request chunk for " << req->start_ts;
+        {
+            std::unique_lock lk(mutex);
+            req_res_map.erase(req->start_ts);
+        }
+        store->delete_range(req_key_prefix, get_req_suffix_key(req->start_ts));
+        res->set_500("Failed to persist write request.");
+        res->final = true;
+        auto req_res = new async_req_res_t(req, res, true);
+        HttpServer::deliver_stream_response(req_res);
+        return;
+    }
 
     bool is_old_serialized_request = (req->start_ts == 0);
     bool read_more_input = (req->_req != nullptr && req->_req->proceed_req);
@@ -356,6 +369,12 @@ void BatchedIndexer::run() {
                     }
                 }
 
+                if(config.get_standalone() && route_found && found_rpath->handler == del_remove_documents) {
+                    // Bulk deletion can defer additional batches to the HTTP pool. Keep the
+                    // collection queue occupied until those batches have finished.
+                    wait_for_standalone_delete(orig_res);
+                }
+
                 //LOG(INFO) << "Erasing request data from disk and memory for request " << req_id;
 
                 // we can delete the buffered request content
@@ -454,6 +473,12 @@ void BatchedIndexer::run() {
     LOG(INFO) << "Batched indexer threadpool shutdown...";
     thread_pool->shutdown();
     delete thread_pool;
+}
+
+void BatchedIndexer::wait_for_standalone_delete(const std::shared_ptr<http_res>& res) {
+    while(!res->final && !quit) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 void BatchedIndexer::add_reference_request(refq_entry&& ref) {

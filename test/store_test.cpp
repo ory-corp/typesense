@@ -3,6 +3,25 @@
 #include <store.h>
 #include <string_utils.h>
 
+TEST(StoreTest, SynchronousWalWritesSurviveReopen) {
+    const std::string path = "/tmp/typesense_test/synchronous_wal_store";
+    system(("rm -rf " + path + " && mkdir -p " + path).c_str());
+
+    {
+        Store store(path, 24*60*60, 1024, false, 0, 4*1048576, 2, 4*1048576, 5, true);
+        ASSERT_TRUE(store.syncs_writes());
+        ASSERT_TRUE(store.insert("key", "value"));
+        ASSERT_TRUE(store.insert("remove", "value"));
+        ASSERT_TRUE(store.delete_range("remove", "removf").ok());
+    }
+
+    Store reopened(path, 24*60*60, 1024, false, 0, 4*1048576, 2, 4*1048576, 5, true);
+    std::string value;
+    EXPECT_EQ(StoreStatus::FOUND, reopened.get("key", value));
+    EXPECT_EQ("value", value);
+    EXPECT_EQ(StoreStatus::NOT_FOUND, reopened.get("remove", value));
+}
+
 TEST(StoreTest, GetUpdatesSince) {
     std::string primary_store_path = "/tmp/typesense_test/primary_store_test";
     LOG(INFO) << "Truncating and creating: " << primary_store_path;

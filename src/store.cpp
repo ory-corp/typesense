@@ -2,7 +2,7 @@
 
 Store::Store(const std::string & state_dir_path, const size_t wal_ttl_secs, const size_t wal_size_mb, bool disable_wal,
              int32_t ttl, size_t write_buffer_size,size_t max_write_buffer_number, size_t max_log_file_size,
-             size_t keep_log_file_num): state_dir_path(state_dir_path) {
+             size_t keep_log_file_num, bool sync_writes): state_dir_path(state_dir_path) {
     // Optimize RocksDB
     options.IncreaseParallelism();
     options.OptimizeLevelStyleCompaction();
@@ -26,6 +26,7 @@ Store::Store(const std::string & state_dir_path, const size_t wal_ttl_secs, cons
     // Disable WAL for master writes (Raft's WAL is used)
     // The replica uses native WAL, though.
     write_options.disableWAL = disable_wal;
+    write_options.sync = sync_writes;
 
     // open DB
     init_db(ttl);
@@ -302,7 +303,7 @@ rocksdb::Status Store::create_check_point(rocksdb::Checkpoint** checkpoint_ptr, 
 
 rocksdb::Status Store::delete_range(const std::string& begin_key, const std::string& end_key) {
     std::shared_lock lock(mutex);
-    return db->DeleteRange(rocksdb::WriteOptions(), db->DefaultColumnFamily(), begin_key, end_key);
+    return db->DeleteRange(write_options, db->DefaultColumnFamily(), begin_key, end_key);
 }
 
 rocksdb::Status Store::compact_range(const rocksdb::Slice& begin_key, const rocksdb::Slice& end_key) {

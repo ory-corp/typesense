@@ -5,6 +5,8 @@
 #include <cmdline.h>
 #include "typesense_server_utils.h"
 #include "tsconfig.h"
+#include <filesystem>
+#include <fstream>
 
 std::vector<char*> get_argv(std::vector<std::string> & args) {
     std::vector<char*> argv;
@@ -22,6 +24,33 @@ public:
 
     }
 };
+
+TEST(ConfigTest, DataDirectoryModeRejectsUnsafeSwitchesAndRecognizesLegacyDirectories) {
+    char temporary_dir[] = "/tmp/typesense_mode_XXXXXX";
+    ASSERT_NE(nullptr, mkdtemp(temporary_dir));
+    const std::string root = temporary_dir;
+
+    const std::string fresh = root + "/fresh";
+    std::filesystem::create_directory(fresh);
+    EXPECT_TRUE(ensure_data_dir_mode(fresh, true));
+    EXPECT_TRUE(ensure_data_dir_mode(fresh, true));
+    EXPECT_FALSE(ensure_data_dir_mode(fresh, false));
+
+    const std::string legacy_standalone = root + "/legacy_standalone";
+    std::filesystem::create_directories(legacy_standalone + "/db");
+    std::ofstream(legacy_standalone + "/db/document") << "preserve me";
+    EXPECT_FALSE(ensure_data_dir_mode(legacy_standalone, false));
+    EXPECT_TRUE(ensure_data_dir_mode(legacy_standalone, true));
+    EXPECT_TRUE(std::filesystem::exists(legacy_standalone + "/db/document"));
+
+    const std::string legacy_raft = root + "/legacy_raft";
+    std::filesystem::create_directories(legacy_raft + "/state");
+    EXPECT_FALSE(ensure_data_dir_mode(legacy_raft, true));
+    EXPECT_TRUE(ensure_data_dir_mode(legacy_raft, false));
+    EXPECT_FALSE(ensure_data_dir_mode(legacy_raft, true));
+
+    std::filesystem::remove_all(root);
+}
 
 TEST(ConfigTest, LoadCmdLineArguments) {
     cmdline::parser options;
