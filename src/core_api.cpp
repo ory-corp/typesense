@@ -161,6 +161,10 @@ bool handle_authentication(std::map<std::string, std::string>& req_params,
 }
 
 void stream_response(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    if(res->final && req->on_final_response) {
+        req->on_final_response();
+    }
+
     if(!res->is_alive) {
         // underlying request is dead or this is a raft log playback
         return ;

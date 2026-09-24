@@ -22,5 +22,7 @@ void init_cmdline_options(cmdline::parser& options, int argc, char **argv);
 
 int init_root_logger(Config& config, const std::string& server_version);
 
+bool ensure_data_dir_mode(const std::string& data_dir, bool standalone);
+
 int run_server(const Config& config, const std::string& version,
                void (*master_server_routes)());

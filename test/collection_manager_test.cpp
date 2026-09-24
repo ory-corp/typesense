@@ -2257,6 +2257,33 @@ TEST_F(CollectionManagerTest, PopulateReferencedIns) {
     ASSERT_TRUE(referenced_ins["C"].at("B").referenced_field.optional);
 }
 
+TEST_F(CollectionManagerTest, PopulateReferencedInsSkipsUnparseableRows) {
+    std::vector<std::string> collection_meta_jsons = {
+            "{not json",
+            R"({
+                "name": "B",
+                "fields": [
+                  {"name": "c_ref", "type": "string", "reference": "C.c_id"}
+                ]
+            })"_json.dump(),
+            "{not json either",
+            R"({
+                "name": "C",
+                "fields": [
+                  {"name": "c_id", "type": "string"}
+                ]
+            })"_json.dump(),
+    };
+
+    std::map<std::string, std::map<std::string, reference_info_t>> referenced_ins;
+    CollectionManager::_populate_referenced_ins(collection_meta_jsons, referenced_ins);
+
+    ASSERT_EQ(1, referenced_ins.size());
+    ASSERT_EQ(1, referenced_ins["C"].count("B"));
+    ASSERT_EQ("c_ref", referenced_ins["C"].at("B").field);
+    ASSERT_EQ("c_id", referenced_ins["C"].at("B").referenced_field.name);
+}
+
 TEST_F(CollectionManagerTest, CollectionPagination) {
     //remove all collections first
     auto collections = collectionManager.get_collections().get();

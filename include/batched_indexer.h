@@ -122,6 +122,21 @@ private:
     void update_coll_to_references_after_request(const std::shared_ptr<http_req>& req,
                                                  const std::string& coll_name);
 
+    // A standalone bulk delete, whose batches continue on the HTTP pool after a client disconnect.
+    struct standalone_delete_t {
+        std::mutex mcv;
+        std::condition_variable cv;
+        bool done = false;
+
+        void finish() {
+            std::lock_guard lk(mcv);
+            done = true;
+            cv.notify_all();
+        }
+    };
+
+    void wait_for_standalone_delete(standalone_delete_t& deletion);
+
     // Caller holds mutex. Combine committed alias state with all outstanding mutations.
     void refresh_alias_references(const std::string& alias);
 

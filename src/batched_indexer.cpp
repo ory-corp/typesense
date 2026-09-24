@@ -89,7 +89,20 @@ void BatchedIndexer::enqueue(const std::shared_ptr<http_req>& req, const std::sh
 
     //LOG(INFO) << "request_chunk_key: " << req->start_ts << "_" << chunk_sequence << ", req body: " << req->body;
 
-    store->insert(request_chunk_key, req->to_json());
+    const bool persisted = store->insert(request_chunk_key, req->to_json());
+    if(!persisted && config.get_standalone()) {
+        LOG(ERROR) << "Failed to persist standalone request chunk for " << req->start_ts;
+        {
+            std::unique_lock lk(mutex);
+            req_res_map.erase(req->start_ts);
+        }
+        store->delete_range(req_key_prefix, get_req_suffix_key(req->start_ts));
+        res->set_500("Failed to persist write request.");
+        res->final = true;
+        auto req_res = new async_req_res_t(req, res, true);
+        HttpServer::deliver_stream_response(req_res);
+        return;
+    }
 
     bool is_old_serialized_request = (req->start_ts == 0);
     bool read_more_input = (req->_req != nullptr && req->_req->proceed_req);
@@ -275,6 +288,7 @@ void BatchedIndexer::run() {
                 route_path* found_rpath = nullptr;
                 bool route_found = server->get_route(orig_req->route_hash, &found_rpath);
                 bool async_res = false;
+                std::shared_ptr<standalone_delete_t> standalone_delete;
 
                 while(iter->Valid() && iter->key().starts_with(req_key_prefix)) {
                     std::shared_lock slk(pause_mutex); // used for snapshot
@@ -317,6 +331,11 @@ void BatchedIndexer::run() {
                                 goto end;
                             }
 
+                            if(config.get_standalone() && found_rpath->handler == del_remove_documents) {
+                                standalone_delete = std::make_shared<standalone_delete_t>();
+                                orig_req->on_final_response = [standalone_delete] { standalone_delete->finish(); };
+                            }
+
                             async_res = found_rpath->async_res;
                             try {
                                 found_rpath->handler(orig_req, orig_res);
@@ -354,6 +373,13 @@ void BatchedIndexer::run() {
                     if(quit) {
                         break;
                     }
+                }
+
+                // A handler that threw has deferred nothing.
+                if(standalone_delete && async_res) {
+                    // Bulk deletion can defer additional batches to the HTTP pool. Keep the
+                    // collection queue occupied until those batches have finished.
+                    wait_for_standalone_delete(*standalone_delete);
                 }
 
                 //LOG(INFO) << "Erasing request data from disk and memory for request " << req_id;
@@ -454,6 +480,14 @@ void BatchedIndexer::run() {
     LOG(INFO) << "Batched indexer threadpool shutdown...";
     thread_pool->shutdown();
     delete thread_pool;
+}
+
+void BatchedIndexer::wait_for_standalone_delete(standalone_delete_t& deletion) {
+    std::unique_lock lk(deletion.mcv);
+    // Deferred batches stop running once the HTTP server has stopped, so give up on shutdown.
+    while(!deletion.done && !quit) {
+        deletion.cv.wait_for(lk, std::chrono::milliseconds(100));
+    }
 }
 
 void BatchedIndexer::add_reference_request(refq_entry&& ref) {

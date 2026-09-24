@@ -8,6 +8,7 @@
 #include <vector>
 #include <future>
 #include <chrono>
+#include <functional>
 #include <iomanip>
 #include "json.hpp"
 #include "string_utils.h"
@@ -321,6 +322,10 @@ struct http_req {
 
     bool is_binary_body = false;
 
+    // Standalone mode: tells BatchedIndexer that a handler continuing on the HTTP pool (bulk delete)
+    // has finished. stream_response() calls it for the final response, even if the client is gone.
+    std::function<void()> on_final_response;
+
     std::atomic<bool> is_write = false;
 
     bool (*async_res_set_headers_callback)(const std::string&, const std::shared_ptr<http_req>, long, std::string&) = nullptr;
@@ -453,7 +458,8 @@ struct http_req {
 
     void load_from_json(const std::string& json_str) {
         nlohmann::json j = nlohmann::json::parse(json_str);
-        route_hash = j["route_hash"];
+        route_hash = j["route_hash"].is_string() ?
+                     std::stoull(j["route_hash"].get<std::string>()) : j["route_hash"].get<uint64_t>();
 
         std::string chunk_body;
         is_binary_body = j.count("is_binary_body") != 0 ? j["is_binary_body"].get<bool>() : false;
@@ -477,7 +483,14 @@ struct http_req {
         metadata = j.count("metadata") != 0 ? j["metadata"] : "";
         first_chunk_aggregate = j.count("first_chunk_aggregate") != 0 ? j["first_chunk_aggregate"].get<bool>() : true;
         last_chunk_aggregate = j.count("last_chunk_aggregate") != 0 ? j["last_chunk_aggregate"].get<bool>() : false;
-        start_ts = j.count("start_ts") != 0 ? j["start_ts"].get<uint64_t>() : 0;
+        if(j.count("start_ts") == 0) {
+            start_ts = 0;
+        } else if(j["start_ts"].is_string()) {
+            start_ts = std::stoull(j["start_ts"].get<std::string>());
+        } else {
+            // Raft logs written by earlier versions store this as a JSON number.
+            start_ts = j["start_ts"].get<uint64_t>();
+        }
         log_index = j.count("log_index") != 0 ? j["log_index"].get<int64_t>() : 0;
     }
 
@@ -614,4 +627,3 @@ struct async_stream_response_t {
     std::condition_variable cv;
     bool ready = false;
 };
-

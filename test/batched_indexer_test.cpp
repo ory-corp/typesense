@@ -1,12 +1,15 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -18,11 +21,21 @@
 
 #define private public
 #include "batched_indexer.h"
+#include "raft_server.h"
 #undef private
 
 #include "collection_manager.h"
+#include "typesense_server_utils.h"
+
+class BatchedIndexerTestConfig : public Config {};
 
 namespace {
+
+// Runs a cleanup however the enclosing scope ends, including a failed ASSERT.
+struct scope_exit_t {
+    std::function<void()> fn;
+    ~scope_exit_t() { fn(); }
+};
 
 std::shared_ptr<http_req> make_req(const uint64_t start_ts, const int64_t log_index,
                                    const std::string& collection) {
@@ -41,6 +54,7 @@ std::shared_ptr<http_res> make_res() {
 
 class BatchedIndexerAliasTest : public ::testing::Test {
 protected:
+    BatchedIndexerTestConfig config;
     std::atomic<bool> quit{false};
     ThreadPool thread_pool{1};
     std::string state_dir;
@@ -62,8 +76,11 @@ protected:
         server->put("/aliases/:alias", put_upsert_alias);
         server->del("/aliases/:alias", del_alias);
         server->post("/collections", post_create_collection);
+        server->post("/collections/:collection/documents/import", post_import_documents, true, true);
+        server->post("/collections/:collection/documents", post_add_document);
+        server->del("/collections/:collection/documents", del_remove_documents, false, true);
         indexer = std::make_unique<BatchedIndexer>(server.get(), store.get(), store.get(), 4,
-                                                   Config::get_instance(), quit);
+                                                   config, quit);
     }
 
     void TearDown() override {
@@ -126,6 +143,209 @@ protected:
         indexer->load_state(state);
     }
 };
+
+TEST_F(BatchedIndexerAliasTest, StandaloneWritesEnterTheOrderedCollectionQueue) {
+    config.set_standalone(true);
+    config.set_data_dir(state_dir);
+    ReplicationState replication_state(server.get(), indexer.get(), store.get(), nullptr,
+                                       &thread_pool, false, &config, 1, 1);
+    replication_state.standalone_running = true;
+
+    auto create = [&](uint64_t id) {
+        auto req = make_req(id, 0, "");
+        req->body = R"({"name":"products","fields":[]})";
+        req->last_chunk_aggregate = true;
+        route_path* route = nullptr;
+        req->route_hash = server->find_route({"collections"}, "POST", &route);
+        EXPECT_NE(nullptr, route);
+        replication_state.write(req, make_res());
+        return req;
+    };
+
+    auto first = create(100);
+    auto second = create(101);
+    const size_t queue_id = StringUtils::hash_wy("products", 8) % 4;
+    ASSERT_EQ(2, indexer->queues[queue_id].size());
+    EXPECT_EQ(first->start_ts, indexer->queues[queue_id][0]);
+    EXPECT_EQ(second->start_ts, indexer->queues[queue_id][1]);
+    EXPECT_EQ(2, indexer->get_queued_writes());
+}
+
+TEST_F(BatchedIndexerAliasTest, ConcurrentStandaloneAdmissionsKeepLogOrder) {
+    config.set_standalone(true);
+    config.set_data_dir(state_dir);
+    ReplicationState replication_state(server.get(), indexer.get(), store.get(), nullptr,
+                                       &thread_pool, false, &config, 1, 1);
+    replication_state.standalone_running = true;
+    constexpr size_t count = 32;
+    std::array<std::shared_ptr<http_req>, count> requests;
+    std::vector<std::thread> writers;
+    std::atomic<bool> start{false};
+    for(size_t i = 0; i < count; ++i) {
+        auto req = make_req(300 + i, 0, "");
+        req->body = R"({"name":"products","fields":[]})";
+        req->last_chunk_aggregate = true;
+        route_path* route = nullptr;
+        req->route_hash = server->find_route({"collections"}, "POST", &route);
+        ASSERT_NE(nullptr, route);
+        requests[i] = req;
+        writers.emplace_back([&, req] {
+            while(!start) std::this_thread::yield();
+            replication_state.write(req, make_res());
+        });
+    }
+    start = true;
+    for(auto& writer: writers) writer.join();
+
+    const size_t queue_id = StringUtils::hash_wy("products", 8) % 4;
+    ASSERT_EQ(count, indexer->queues[queue_id].size());
+    int64_t previous_index = 0;
+    for(auto request_id: indexer->queues[queue_id]) {
+        const auto& req = requests[request_id - 300];
+        EXPECT_GT(req->log_index, previous_index);
+        previous_index = req->log_index;
+    }
+}
+
+TEST_F(BatchedIndexerAliasTest, StandaloneDeleteKeepsItsQueueAfterTheClientDisconnects) {
+    config.set_standalone(true);
+    config.set_data_dir(state_dir);
+    auto schema = nlohmann::json::parse(R"({"name":"products","fields":[{"name":"title","type":"string"}]})");
+    auto create_op = cm.create_collection(schema);
+    ASSERT_TRUE(create_op.ok());
+    Collection* products = create_op.get();
+    for(const std::string id : {"a", "b", "c"}) {
+        ASSERT_TRUE(products->add(nlohmann::json{{"id", id}, {"title", "x"}}.dump()).ok());
+    }
+    ReplicationState replication_state(server.get(), indexer.get(), store.get(), nullptr,
+                                       &thread_pool, false, &config, 1, 1);
+    replication_state.standalone_running = true;
+    // Deferred handler batches are scheduled through the global server.
+    HttpServer* const previous_server = ::server;
+    ::server = server.get();
+
+    // Hold back the HTTP pool, which runs the deletion's deferred batches.
+    std::promise<void> release_pool;
+    std::shared_future<void> pool_released = release_pool.get_future().share();
+    thread_pool.enqueue([pool_released] { pool_released.wait(); });
+    bool pool_blocked = true;
+    auto unblock_pool = [&] {
+        if(pool_blocked) {
+            pool_blocked = false;
+            release_pool.set_value();
+        }
+    };
+    std::thread runner([&] { indexer->run(); });
+    scope_exit_t stop_indexer{[&] {
+        unblock_pool();
+        indexer->stop();
+        runner.join();
+        ::server = previous_server;
+    }};
+
+    auto wait_until = [](const std::function<bool()>& condition) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while(!condition() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return condition();
+    };
+
+    auto deletion = make_req(20, 0, "products");
+    deletion->params["filter_by"] = "title:=x";
+    deletion->params["batch_size"] = "1";
+    deletion->last_chunk_aggregate = true;
+    route_path* route = nullptr;
+    deletion->route_hash = server->find_route({"collections", "products", "documents"}, "DELETE", &route);
+    ASSERT_NE(nullptr, route);
+    auto deletion_res = make_res();
+    deletion_res->is_alive = true;
+    replication_state.write(deletion, deletion_res);
+
+    // The indexer ran the first batch; the next one waits for the HTTP pool.
+    ASSERT_TRUE(wait_until([&] { return products->get_num_documents() == 2; }));
+    ASSERT_FALSE(products->get("a").ok());
+
+    // The client disconnects, as in HttpServer::on_res_generator_dispose().
+    deletion_res->final = true;
+    deletion_res->is_alive = false;
+
+    auto upsert = make_req(21, 0, "products");
+    upsert->params["action"] = "upsert";
+    upsert->body = R"({"id":"c","title":"y"})";
+    upsert->last_chunk_aggregate = true;
+    upsert->route_hash = server->find_route({"collections", "products", "documents"}, "POST", &route);
+    ASSERT_NE(nullptr, route);
+    auto upsert_res = make_res();
+    upsert_res->is_alive = true;
+    replication_state.write(upsert, upsert_res);
+
+    // The upsert waits for the deletion, whose remaining batches still include "c".
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    auto pending = products->get("c");
+    ASSERT_TRUE(pending.ok());
+    EXPECT_EQ("x", pending.get()["title"].get<std::string>());
+
+    unblock_pool();
+    EXPECT_TRUE(wait_until([&] { return indexer->get_queued_writes() == 0; }));
+    EXPECT_FALSE(products->get("b").ok());
+    auto upserted = products->get("c");
+    ASSERT_TRUE(upserted.ok());
+    EXPECT_EQ("y", upserted.get()["title"].get<std::string>());
+    EXPECT_EQ(201, upsert_res->status_code) << upsert_res->body;
+}
+
+TEST_F(BatchedIndexerAliasTest, StandaloneImportPersistsAndReleasesEachChunk) {
+    config.set_standalone(true);
+    config.set_data_dir(state_dir);
+    ReplicationState replication_state(server.get(), indexer.get(), store.get(), nullptr,
+                                       &thread_pool, false, &config, 1, 1);
+    replication_state.standalone_running = true;
+    auto req = make_req(200, 0, "products");
+    route_path* route = nullptr;
+    req->route_hash = server->find_route({"collections", "products", "documents", "import"},
+                                          "POST", &route);
+    ASSERT_NE(nullptr, route);
+    auto res = make_res();
+
+    req->body = R"({"id":"one"})";
+    req->last_chunk_aggregate = false;
+    replication_state.write(req, res);
+    EXPECT_TRUE(req->body.empty());
+    EXPECT_EQ(0, indexer->get_queued_writes());
+    EXPECT_EQ(1, indexer->req_res_map.at(200).num_chunks);
+
+    req->body = "\n" R"({"id":"two"})";
+    req->last_chunk_aggregate = true;
+    replication_state.write(req, res);
+    EXPECT_EQ(2, indexer->req_res_map.at(200).num_chunks);
+    EXPECT_EQ(2, indexer->get_queued_writes());
+    const size_t queue_id = StringUtils::hash_wy("products", 8) % 4;
+    ASSERT_EQ(1, indexer->queues[queue_id].size());
+    EXPECT_EQ(200, indexer->queues[queue_id].front());
+}
+
+TEST_F(BatchedIndexerAliasTest, StandaloneWriteFailsWhenItsRequestChunkCannotBePersisted) {
+    config.set_standalone(true);
+    const std::string failing_path = state_dir + "/failing-store";
+    std::filesystem::create_directory(failing_path);
+    // RocksDB rejects synchronous writes when the WAL is disabled.
+    Store failing_store(failing_path, 24*60*60, 1024, true, 0, 4*1048576, 2, 4*1048576, 5, true);
+    BatchedIndexer failing_indexer(server.get(), &failing_store, store.get(), 4, config, quit);
+    auto req = make_req(500, 500, "products");
+    req->body = R"({"id":"one"})";
+    req->last_chunk_aggregate = true;
+    route_path* route = nullptr;
+    req->route_hash = server->find_route({"collections", "products", "documents", "import"},
+                                          "POST", &route);
+    ASSERT_NE(nullptr, route);
+    auto res = make_res();
+
+    failing_indexer.enqueue(req, res);
+    EXPECT_EQ(500, res->status_code);
+    EXPECT_TRUE(failing_indexer.req_res_map.empty());
+    EXPECT_EQ(0, failing_indexer.get_queued_writes());
+}
 
 TEST_F(BatchedIndexerAliasTest, ResolvedAliasSchemaStillOrdersFailedSwapAfterChildCreation) {
     auto schema = nlohmann::json::parse(

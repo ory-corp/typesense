@@ -7,6 +7,9 @@
 #include <braft/raft.h>
 #include <raft_server.h>
 #include <fstream>
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
 #include <execinfo.h>
 #include <http_client.h>
 
@@ -58,6 +61,65 @@ bool using_jemalloc() {
 #else
     return (mallctl != nullptr);
 #endif
+}
+
+bool ensure_data_dir_mode(const std::string& data_dir, bool standalone) {
+    const std::string marker = data_dir + "/.typesense-mode";
+    const std::string expected = standalone ? "standalone\n" : "raft\n";
+
+    auto check_marker = [&]() {
+        std::ifstream input(marker);
+        const std::string actual((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        if(!input.good() && !input.eof()) {
+            LOG(ERROR) << "Cannot read data directory mode marker: " << marker;
+            return false;
+        }
+        if(actual != expected) {
+            LOG(ERROR) << "Data directory " << data_dir << " was initialized for " << actual
+                       << " and cannot be opened in " << expected << " mode.";
+            return false;
+        }
+        return true;
+    };
+
+    if(file_exists(marker)) {
+        return check_marker();
+    }
+
+    // Older directories have no marker. Raft always creates state; standalone only creates db.
+    // Refuse a markerless db without Raft state in Raft mode so a startup cannot clear it.
+    const bool has_raft_state = directory_exists(data_dir + "/state");
+    const bool has_db = directory_exists(data_dir + "/db");
+    if((standalone && has_raft_state) || (!standalone && has_db && !has_raft_state)) {
+        LOG(ERROR) << "Cannot determine a safe data directory mode for " << data_dir
+                   << ". Use the mode that created it or migrate the data explicitly.";
+        return false;
+    }
+
+    const int fd = open(marker.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if(fd < 0) {
+        if(errno == EEXIST) return check_marker();
+        LOG(ERROR) << "Cannot create data directory mode marker: " << marker;
+        return false;
+    }
+
+    const bool written = write(fd, expected.data(), expected.size()) == static_cast<ssize_t>(expected.size());
+    const bool synced = written && fsync(fd) == 0;
+    close(fd);
+    if(!synced) {
+        unlink(marker.c_str());
+        LOG(ERROR) << "Cannot persist data directory mode marker: " << marker;
+        return false;
+    }
+
+    const int dir_fd = open(data_dir.c_str(), O_RDONLY);
+    const bool dir_synced = dir_fd >= 0 && fsync(dir_fd) == 0;
+    if(dir_fd >= 0) close(dir_fd);
+    if(!dir_synced) {
+        LOG(ERROR) << "Cannot persist data directory mode marker directory: " << data_dir;
+        return false;
+    }
+    return true;
 }
 
 void catch_interrupt(int sig) {
@@ -128,6 +190,7 @@ void init_cmdline_options(cmdline::parser & options, int argc, char **argv) {
     options.add<int>("disk-used-max-percentage", '\0', "Reject writes when used disk space exceeds this percentage. Default: 100 (never reject).", false, 100);
     options.add<int>("memory-used-max-percentage", '\0', "Reject writes when memory usage exceeds this percentage. Default: 100 (never reject).", false, 100);
     options.add<bool>("skip-writes", '\0', "Skip all writes except config changes. Default: false.", false, false);
+    options.add<bool>("standalone", '\0', "Run as a single node without Raft or replication. Default: false.", false, false);
     options.add<bool>("reset-peers-on-error", '\0', "Reset node's peers on clustering error. Default: false.", false, false);
 
     options.add<int>("log-slow-searches-time-ms", '\0', "When >= 0, searches that take longer than this duration are logged.", false, 30*1000);
@@ -382,6 +445,27 @@ int start_raft_server(ReplicationState& replication_state, Store& store,
                       uint32_t api_port, int snapshot_interval_seconds, int snapshot_max_byte_count_per_rpc,
                       const std::atomic<bool>& reset_peers_on_error) {
 
+    if(Config::get_instance().get_standalone()) {
+        // STANDALONE: no Raft. Bring the state machine up directly (load collections from the
+        // durable store), then idle this thread until shutdown. Writes are applied directly by
+        // ReplicationState::write() instead of going through the Raft log.
+        LOG(INFO) << "Starting Typesense in STANDALONE mode (no Raft, single node).";
+
+        if(replication_state.start_standalone(api_port) != 0) {
+            LOG(ERROR) << "Failed to start standalone state machine.";
+            exit(-1);
+        }
+
+        while(!quit_raft_service.load()) {
+            sleep(1);
+        }
+
+        LOG(INFO) << "Standalone service is going to quit.";
+
+        replication_state.shutdown();
+        return 0;
+    }
+
     if(path_to_nodes.empty()) {
         LOG(INFO) << "Since no --nodes argument is provided, starting a single node Typesense cluster.";
     }
@@ -522,6 +606,10 @@ int run_server(const Config & config, const std::string & version, void (*master
         return 1;
     }
 
+    if(!ensure_data_dir_mode(config.get_data_dir(), config.get_standalone())) {
+        return 1;
+    }
+
     if (config.get_enable_search_analytics() && !config.get_analytics_dir().empty() &&
         !directory_exists(config.get_analytics_dir())) {
         LOG(INFO) << "Analytics directory " << config.get_analytics_dir() << " does not exist, will create it...";
@@ -570,9 +658,14 @@ int run_server(const Config & config, const std::string & version, void (*master
     ThreadPool server_thread_pool(num_threads);
     ThreadPool replication_thread_pool(num_threads);
 
-    // primary DB used for storing the documents: we will not use WAL since Raft provides that
-    Store store(db_dir, 24*60*60, 1024, true, 0, db_write_buffer_size, db_max_write_buffer_number,
-                db_max_log_file_size, db_keep_log_file_num);
+    // Primary DB used for storing the documents. The store WAL is what makes a write survive a
+    // process restart, so its setting depends on where durability comes from:
+    //   - Raft (default): Raft's replicated log is the WAL, so the store WAL is disabled.
+    //   - --standalone: there is no Raft log, so the store uses a synchronous RocksDB WAL.
+    //     CollectionManager::load() rebuilds the in-memory index from recovered writes.
+    const bool disable_db_wal = !config.get_standalone();
+    Store store(db_dir, 24*60*60, 1024, disable_db_wal, 0, db_write_buffer_size, db_max_write_buffer_number,
+                db_max_log_file_size, db_keep_log_file_num, config.get_standalone());
 
     // meta DB for storing house keeping things
     Store meta_store(meta_dir, 24*60*60, 1024, false);

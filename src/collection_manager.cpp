@@ -507,7 +507,10 @@ void CollectionManager::_populate_referenced_ins(const std::vector<std::string>&
                                                  std::map<std::string, std::map<std::string, reference_info_t>>& referenced_ins) {
     std::map<std::string, uint32_t> collection_index;
     for (size_t i = 0; i < collection_meta_jsons.size(); i++) {
-        auto const& obj = nlohmann::json::parse(collection_meta_jsons[i]);
+        // Parse without exceptions: a single unparseable collection-meta row must not terminate
+        // the process here. is_discarded() (checked below) catches the failure and skips the row,
+        // which is what the surrounding guard already intends.
+        auto const& obj = nlohmann::json::parse(collection_meta_jsons[i], nullptr, false);
         if (obj.is_discarded() || !obj.is_object() || !obj.contains("name") || !obj["name"].is_string() ||
             !obj.contains("fields")) {
             continue;
@@ -546,7 +549,7 @@ void CollectionManager::_populate_referenced_ins(const std::vector<std::string>&
             } else {
                 size_t ref_index = i;
                 for (size_t j = i + 1; j < collection_meta_jsons.size(); j++) {
-                    auto const& ref_obj = nlohmann::json::parse(collection_meta_jsons[j]);
+                    auto const& ref_obj = nlohmann::json::parse(collection_meta_jsons[j], nullptr, false);
                     if (ref_obj.is_discarded() || !ref_obj.is_object() || !ref_obj.contains("name") || !ref_obj["name"].is_string() ||
                         !ref_obj.contains("fields")) {
                         continue;

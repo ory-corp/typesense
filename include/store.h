@@ -77,7 +77,10 @@ public:
           size_t write_buffer_size = 4*1048576,
           size_t max_write_buffer_number = 2,
           size_t max_log_file_size = 4*1048576,
-          size_t keep_log_file_num = 5);
+          size_t keep_log_file_num = 5,
+          bool sync_writes = false);
+
+    bool syncs_writes() const { return write_options.sync; }
 
     ~Store();
 
