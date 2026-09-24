@@ -122,6 +122,8 @@ private:
     void update_coll_to_references_after_request(const std::shared_ptr<http_req>& req,
                                                  const std::string& coll_name);
 
+    void wait_for_standalone_delete(const std::shared_ptr<http_res>& res);
+
     // Caller holds mutex. Combine committed alias state with all outstanding mutations.
     void refresh_alias_references(const std::string& alias);
 

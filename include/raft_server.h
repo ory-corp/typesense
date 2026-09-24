@@ -8,6 +8,8 @@
 #include <braft/protobuf_file.h>         // braft::ProtoBufFile
 #include <rocksdb/db.h>
 #include <future>
+#include <array>
+#include <mutex>
 
 #include "http_data.h"
 #include "threadpool.h"
@@ -133,6 +135,12 @@ private:
 
     std::string raft_dir_path;
 
+    std::string resource_check_path() const {
+        return standalone_running ? config->get_data_dir() : raft_dir_path;
+    }
+
+    int clear_standalone_request_logs();
+
     std::string ext_snapshot_path;
 
     int election_timeout_interval_ms;
@@ -143,6 +151,7 @@ private:
 
     std::atomic<bool> shutting_down;
     std::atomic<size_t> pending_writes;
+    std::atomic<bool> standalone_running{false};
 
     std::atomic<size_t> snapshot_in_progress;
 
@@ -150,6 +159,10 @@ private:
     uint64_t last_snapshot_ts;              // when last snapshot ran
 
     butil::EndPoint peering_endpoint;
+
+    // --standalone only: a monotonic sequence used in place of the Raft log index.
+    std::atomic<int64_t> standalone_seq{1};
+    std::mutex standalone_enqueue_mutex;
 
 public:
 
@@ -167,6 +180,10 @@ public:
               int election_timeout_ms, int snapshot_max_byte_count_per_rpc,
               const std::string & raft_dir, const std::string & nodes,
               const std::atomic<bool>& quit_abruptly);
+
+    // Starts the state machine in --standalone mode (no Raft): loads collections from the
+    // durable store and marks the node ready/leader. Writes are applied directly (see write()).
+    int start_standalone(int api_port);
 
     // Generic write method for synchronizing all writes
     void write(const std::shared_ptr<http_req>& request, const std::shared_ptr<http_res>& response);

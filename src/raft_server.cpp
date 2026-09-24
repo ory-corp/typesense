@@ -183,6 +183,46 @@ bool ReplicationState::has_persisted_raft_state(const std::string& raft_dir) {
     return log_storage.init(&configuration_manager) == 0 && log_storage.last_log_index() > 0;
 }
 
+int ReplicationState::start_standalone(int api_port) {
+    // No Raft. The document store was already opened with its own RocksDB WAL, so any writes from
+    // a previous run have already been recovered by DB::Open. We just load the collections from
+    // the store into memory. We deliberately do NOT call store->reload(true, ...) here: that
+    // clears the state dir, which the Raft path does so the replayed log can rebuild the store —
+    // there is no log to replay in standalone, and clearing the state dir would throw away
+    // exactly the data we want to recover.
+    if(clear_standalone_request_logs() != 0) {
+        return -1;
+    }
+    int init_db_status = init_db();
+    if(init_db_status != 0) {
+        LOG(ERROR) << "Failed to initialize DB in standalone mode.";
+        return init_db_status;
+    }
+
+    // Present as a healthy, caught-up leader so reads, /health, and the leader-only code paths
+    // (analytics, conversations, …) behave exactly as on a normal single node.
+    read_caught_up = true;
+    write_caught_up = true;
+    leader_term.store(1, butil::memory_order_release);
+    standalone_running = true;
+
+    notify();
+
+    LOG(INFO) << "Standalone state machine ready (api_port " << api_port << ").";
+    return 0;
+}
+
+int ReplicationState::clear_standalone_request_logs() {
+    // Requests left by an interrupted import were never acknowledged. No Raft replay occurs in
+    // standalone mode, so discard these staging records before loading collections.
+    const auto status = store->delete_range(BatchedIndexer::RAFT_REQ_LOG_PREFIX, "$RL`");
+    if(!status.ok()) {
+        LOG(ERROR) << "Failed to remove abandoned standalone request chunks: " << status.ToString();
+        return -1;
+    }
+    return 0;
+}
+
 // returns empty string if DNS resolution fails for any of the nodes
 std::string ReplicationState::to_nodes_config(const butil::EndPoint& peering_endpoint, const int api_port,
                                               const std::string& nodes_config) {
@@ -337,8 +377,15 @@ void ReplicationState::write(const std::shared_ptr<http_req>& request, const std
         return ;
     }
 
+    if(config->get_standalone() && !standalone_running) {
+        response->set_503("Not ready.");
+        response->final = true;
+        auto req_res = new async_req_res_t(request, response, true);
+        return HttpServer::deliver_stream_response(req_res);
+    }
+
     // reject write if disk space is running out
-    auto resource_check = cached_resource_stat_t::get_instance().has_enough_resources(raft_dir_path,
+    auto resource_check = cached_resource_stat_t::get_instance().has_enough_resources(resource_check_path(),
                                   config->get_disk_used_max_percentage(), config->get_memory_used_max_percentage());
 
     if (resource_check != cached_resource_stat_t::OK && request->do_resource_check()) {
@@ -371,6 +418,30 @@ void ReplicationState::write(const std::shared_ptr<http_req>& request, const std
         }
     }
 
+    if(config->get_standalone()) {
+        // Each import chunk is persisted and released before the HTTP library reads the next
+        // one. BatchedIndexer reassembles partial documents when it processes the request.
+        if(((request->body.size() > 2) &&
+            (0x1f == (unsigned char)request->body[0] && 0x8b == (unsigned char)request->body[1])) ||
+           request->zstream_initialized) {
+            auto res = handle_gzip(request);
+
+            if(!res.ok()) {
+                response->set_422(res.error());
+                response->final = true;
+                auto req_res = new async_req_res_t(request, response, true);
+                return HttpServer::deliver_stream_response(req_res);
+            }
+        }
+
+        {
+            std::lock_guard lock(standalone_enqueue_mutex);
+            request->log_index = standalone_seq.fetch_add(1, std::memory_order_relaxed);
+            batched_indexer->enqueue(request, response);
+        }
+        return ;
+    }
+
     std::shared_lock lock(node_mutex);
 
     if(!node) {
@@ -381,9 +452,12 @@ void ReplicationState::write(const std::shared_ptr<http_req>& request, const std
         return write_to_leader(request, response);
     }
 
-    //check if it's first gzip chunk or is gzip stream initialized
+    // Check if it's the first gzip chunk or the gzip stream is already initialized.
+    // The magic bytes must be compared as unsigned char: plain char is unsigned on aarch64,
+    // where a signed comparison against 0x8b (-117) would never match.
     if(((request->body.size() > 2) &&
-        (31 == (int)request->body[0] && -117 == (int)request->body[1])) || request->zstream_initialized) {
+        (0x1f == (unsigned char)request->body[0] && 0x8b == (unsigned char)request->body[1])) ||
+       request->zstream_initialized) {
         auto res = handle_gzip(request);
 
         if(!res.ok()) {
@@ -1049,6 +1123,11 @@ bool ReplicationState::is_alive() const {
 }
 
 uint64_t ReplicationState::node_state() const {
+    if(config->get_standalone()) {
+        // braft::State LEADER == 1; report it so health/status endpoints treat us as a healthy leader
+        return 1;
+    }
+
     std::shared_lock lock(node_mutex);
 
     if(node == nullptr) {
@@ -1223,6 +1302,11 @@ int64_t ReplicationState::get_num_queued_writes() {
 }
 
 bool ReplicationState::is_leader() {
+    if(config->get_standalone()) {
+        // single node, no Raft: always the leader
+        return true;
+    }
+
     std::shared_lock lock(node_mutex);
 
     if(!node) {
@@ -1234,6 +1318,13 @@ bool ReplicationState::is_leader() {
 
 nlohmann::json ReplicationState::get_status() {
     nlohmann::json status;
+
+    if(standalone_running) {
+        status["state"] = "LEADER";
+        status["committed_index"] = 0;
+        status["queued_writes"] = get_num_queued_writes();
+        return status;
+    }
 
     std::shared_lock lock(node_mutex);
     if(!node) {

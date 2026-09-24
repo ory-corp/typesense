@@ -7,13 +7,17 @@
 #include <filesystem>
 #include <future>
 #include <string>
+#include <filesystem>
 #include <limits>
+#include "store.h"
 
 #define private public
 #include "raft_server.h"
 #undef private
 
 namespace {
+    class StandaloneTestConfig : public Config {};
+
     std::shared_ptr<http_res> seed_indexer_request(BatchedIndexer& indexer, const uint64_t request_id,
                                                    const bool live_response) {
         auto req = std::make_shared<http_req>();
@@ -150,6 +154,43 @@ namespace {
     }
 }
 
+TEST(RaftServerTest, RejectsStandaloneWritesUntilCollectionsAreLoaded) {
+    StandaloneTestConfig config;
+    config.set_standalone(true);
+    ReplicationState replication_state(nullptr, nullptr, nullptr, nullptr, nullptr, false,
+                                       &config, 1, 1);
+    auto req = std::make_shared<http_req>();
+    auto res = std::make_shared<http_res>(nullptr);
+    replication_state.write(req, res);
+    EXPECT_EQ(503, res->status_code);
+}
+
+TEST(RaftServerTest, RequestLogRoundTripsLargeAndLegacyTimestamps) {
+    auto req = std::make_shared<http_req>();
+    req->start_ts = 1790182710717669ULL;
+    req->route_hash = 1790182710717669ULL;
+    req->body = R"({"name":"products"})";
+    req->log_index = 42;
+    const auto serialized = req->to_json();
+    ASSERT_TRUE(nlohmann::json::accept(serialized));
+    EXPECT_TRUE(nlohmann::json::parse(serialized)["start_ts"].is_number_unsigned());
+    EXPECT_TRUE(nlohmann::json::parse(serialized)["route_hash"].is_number_unsigned());
+
+    auto restored = std::make_shared<http_req>();
+    restored->load_from_json(serialized);
+    EXPECT_EQ(req->start_ts, restored->start_ts);
+    EXPECT_EQ(req->route_hash, restored->route_hash);
+    EXPECT_EQ(req->body, restored->body);
+    EXPECT_EQ(req->log_index, restored->log_index);
+
+    auto string_encoded = nlohmann::json::parse(serialized);
+    string_encoded["start_ts"] = "42";
+    string_encoded["route_hash"] = "43";
+    restored->load_from_json(string_encoded.dump());
+    EXPECT_EQ(42, restored->start_ts);
+    EXPECT_EQ(43, restored->route_hash);
+}
+
 TEST(RaftServerTest, JsonIntegerFormattingRoundTripsLargeValues) {
     for(const int64_t value: {int64_t{17}, int64_t{1790182710717669LL},
                               std::numeric_limits<int64_t>::min(),
@@ -160,6 +201,63 @@ TEST(RaftServerTest, JsonIntegerFormattingRoundTripsLargeValues) {
     }
     const auto largest = std::numeric_limits<uint64_t>::max();
     EXPECT_EQ(largest, nlohmann::json::parse(nlohmann::json(largest).dump()).get<uint64_t>());
+}
+
+TEST(RaftServerTest, SnapshotLoadGateBlocksReadinessAndCatchupRefresh) {
+    auto& config = Config::get_instance();
+    ReplicationState replication_state(nullptr, nullptr, nullptr, nullptr, nullptr, false,
+                                       &config, 1, 1);
+
+    replication_state.read_caught_up = true;
+    replication_state.write_caught_up = true;
+    replication_state.snapshot_load_blocks_readiness = true;
+    EXPECT_FALSE(replication_state.is_read_caught_up());
+    EXPECT_FALSE(replication_state.is_write_caught_up());
+
+    std::unique_lock snapshot_load_lock(replication_state.snapshot_load_mutex);
+    replication_state.snapshot_load_blocks_readiness = false;
+    auto refresh = std::async(std::launch::async, [&replication_state]() {
+        replication_state.refresh_catchup_status(false);
+    });
+
+    EXPECT_EQ(std::future_status::timeout, refresh.wait_for(std::chrono::milliseconds(50)));
+    snapshot_load_lock.unlock();
+    EXPECT_EQ(std::future_status::ready, refresh.wait_for(std::chrono::seconds(1)));
+    EXPECT_FALSE(replication_state.is_read_caught_up());
+    EXPECT_FALSE(replication_state.is_write_caught_up());
+}
+
+TEST(RaftServerTest, StandaloneStatusReportsReadinessAndQueuedWrites) {
+    std::atomic<bool> skip_writes(false);
+    auto& config = Config::get_instance();
+    BatchedIndexer indexer(nullptr, nullptr, nullptr, 1, config, skip_writes);
+    ReplicationState replication_state(nullptr, &indexer, nullptr, nullptr, nullptr, false,
+                                       &config, 1, 1);
+
+    EXPECT_EQ("NOT_READY", replication_state.get_status().at("state"));
+    replication_state.standalone_running = true;
+    indexer.queued_writes = 7;
+
+    EXPECT_EQ(7, replication_state.get_num_queued_writes());
+    auto status = replication_state.get_status();
+    EXPECT_EQ("LEADER", status.at("state"));
+    EXPECT_EQ(7, status.at("queued_writes"));
+    EXPECT_EQ(0, status.at("committed_index"));
+}
+
+TEST(RaftServerTest, ResourceCheckUsesTheDataDirectoryInStandaloneMode) {
+    auto& config = Config::get_instance();
+    const std::string old_data_dir = config.get_data_dir();
+    config.set_data_dir("/standalone-data");
+    ReplicationState replication_state(nullptr, nullptr, nullptr, nullptr, nullptr, false,
+                                       &config, 1, 1);
+    replication_state.raft_dir_path = "/raft-state";
+
+    EXPECT_EQ("/raft-state", replication_state.resource_check_path());
+    replication_state.standalone_running = true;
+    EXPECT_EQ("/standalone-data", replication_state.resource_check_path());
+
+    config.set_data_dir(old_data_dir);
 }
 
 TEST(RaftServerTest, DecompressesHighlyCompressibleGzipAcrossChunks) {
@@ -191,28 +289,23 @@ TEST(RaftServerTest, DecompressesHighlyCompressibleGzipAcrossChunks) {
     EXPECT_EQ(payload, result);
 }
 
-TEST(RaftServerTest, SnapshotLoadGateBlocksReadinessAndCatchupRefresh) {
-    auto& config = Config::get_instance();
-    ReplicationState replication_state(nullptr, nullptr, nullptr, nullptr, nullptr, false,
-                                       &config, 1, 1);
-
-    replication_state.read_caught_up = true;
-    replication_state.write_caught_up = true;
-    replication_state.snapshot_load_blocks_readiness = true;
-    EXPECT_FALSE(replication_state.is_read_caught_up());
-    EXPECT_FALSE(replication_state.is_write_caught_up());
-
-    std::unique_lock snapshot_load_lock(replication_state.snapshot_load_mutex);
-    replication_state.snapshot_load_blocks_readiness = false;
-    auto refresh = std::async(std::launch::async, [&replication_state]() {
-        replication_state.refresh_catchup_status(false);
-    });
-
-    EXPECT_EQ(std::future_status::timeout, refresh.wait_for(std::chrono::milliseconds(50)));
-    snapshot_load_lock.unlock();
-    EXPECT_EQ(std::future_status::ready, refresh.wait_for(std::chrono::seconds(1)));
-    EXPECT_FALSE(replication_state.is_read_caught_up());
-    EXPECT_FALSE(replication_state.is_write_caught_up());
+TEST(RaftServerTest, ClearsOnlyAbandonedStandaloneRequestChunksOnStartup) {
+    char path[] = "/tmp/typesense-standalone-chunks-XXXXXX";
+    ASSERT_NE(nullptr, mkdtemp(path));
+    {
+        Store store(path, 24*60*60, 1024, false, 0, 4*1048576, 2, 4*1048576, 5, true);
+        ASSERT_TRUE(store.insert("$RL_orphan", "chunk"));
+        ASSERT_TRUE(store.insert("collection", "preserve"));
+        auto& config = Config::get_instance();
+        ReplicationState replication_state(nullptr, nullptr, &store, nullptr, nullptr, false,
+                                           &config, 1, 1);
+        ASSERT_EQ(0, replication_state.clear_standalone_request_logs());
+        std::string value;
+        EXPECT_EQ(StoreStatus::NOT_FOUND, store.get("$RL_orphan", value));
+        EXPECT_EQ(StoreStatus::FOUND, store.get("collection", value));
+        EXPECT_EQ("preserve", value);
+    }
+    std::filesystem::remove_all(path);
 }
 
 TEST(RaftServerTest, RestoresBatchedIndexerStateByStoreStatusAndFailsClosed) {

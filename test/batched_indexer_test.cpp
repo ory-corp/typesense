@@ -1,12 +1,14 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <future>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -18,9 +20,12 @@
 
 #define private public
 #include "batched_indexer.h"
+#include "raft_server.h"
 #undef private
 
 #include "collection_manager.h"
+
+class BatchedIndexerTestConfig : public Config {};
 
 namespace {
 
@@ -41,6 +46,7 @@ std::shared_ptr<http_res> make_res() {
 
 class BatchedIndexerAliasTest : public ::testing::Test {
 protected:
+    BatchedIndexerTestConfig config;
     std::atomic<bool> quit{false};
     ThreadPool thread_pool{1};
     std::string state_dir;
@@ -62,8 +68,9 @@ protected:
         server->put("/aliases/:alias", put_upsert_alias);
         server->del("/aliases/:alias", del_alias);
         server->post("/collections", post_create_collection);
+        server->post("/collections/:collection/documents/import", post_import_documents, true, true);
         indexer = std::make_unique<BatchedIndexer>(server.get(), store.get(), store.get(), 4,
-                                                   Config::get_instance(), quit);
+                                                   config, quit);
     }
 
     void TearDown() override {
@@ -126,6 +133,134 @@ protected:
         indexer->load_state(state);
     }
 };
+
+TEST_F(BatchedIndexerAliasTest, StandaloneWritesEnterTheOrderedCollectionQueue) {
+    config.set_standalone(true);
+    config.set_data_dir(state_dir);
+    ReplicationState replication_state(server.get(), indexer.get(), store.get(), nullptr,
+                                       &thread_pool, false, &config, 1, 1);
+    replication_state.standalone_running = true;
+
+    auto create = [&](uint64_t id) {
+        auto req = make_req(id, 0, "");
+        req->body = R"({"name":"products","fields":[]})";
+        req->last_chunk_aggregate = true;
+        route_path* route = nullptr;
+        req->route_hash = server->find_route({"collections"}, "POST", &route);
+        EXPECT_NE(nullptr, route);
+        replication_state.write(req, make_res());
+        return req;
+    };
+
+    auto first = create(100);
+    auto second = create(101);
+    const size_t queue_id = StringUtils::hash_wy("products", 8) % 4;
+    ASSERT_EQ(2, indexer->queues[queue_id].size());
+    EXPECT_EQ(first->start_ts, indexer->queues[queue_id][0]);
+    EXPECT_EQ(second->start_ts, indexer->queues[queue_id][1]);
+    EXPECT_EQ(2, indexer->get_queued_writes());
+}
+
+TEST_F(BatchedIndexerAliasTest, ConcurrentStandaloneAdmissionsKeepLogOrder) {
+    config.set_standalone(true);
+    config.set_data_dir(state_dir);
+    ReplicationState replication_state(server.get(), indexer.get(), store.get(), nullptr,
+                                       &thread_pool, false, &config, 1, 1);
+    replication_state.standalone_running = true;
+    constexpr size_t count = 32;
+    std::array<std::shared_ptr<http_req>, count> requests;
+    std::vector<std::thread> writers;
+    std::atomic<bool> start{false};
+    for(size_t i = 0; i < count; ++i) {
+        auto req = make_req(300 + i, 0, "");
+        req->body = R"({"name":"products","fields":[]})";
+        req->last_chunk_aggregate = true;
+        route_path* route = nullptr;
+        req->route_hash = server->find_route({"collections"}, "POST", &route);
+        ASSERT_NE(nullptr, route);
+        requests[i] = req;
+        writers.emplace_back([&, req] {
+            while(!start) std::this_thread::yield();
+            replication_state.write(req, make_res());
+        });
+    }
+    start = true;
+    for(auto& writer: writers) writer.join();
+
+    const size_t queue_id = StringUtils::hash_wy("products", 8) % 4;
+    ASSERT_EQ(count, indexer->queues[queue_id].size());
+    int64_t previous_index = 0;
+    for(auto request_id: indexer->queues[queue_id]) {
+        const auto& req = requests[request_id - 300];
+        EXPECT_GT(req->log_index, previous_index);
+        previous_index = req->log_index;
+    }
+}
+
+TEST_F(BatchedIndexerAliasTest, DeferredStandaloneDeleteKeepsItsQueueOccupied) {
+    config.set_standalone(true);
+    auto res = make_res();
+    res->final = false;
+    auto waiter = std::async(std::launch::async, [&] {
+        indexer->wait_for_standalone_delete(res);
+    });
+
+    EXPECT_EQ(std::future_status::timeout, waiter.wait_for(std::chrono::milliseconds(30)));
+    res->final = true;
+    EXPECT_EQ(std::future_status::ready, waiter.wait_for(std::chrono::seconds(1)));
+}
+
+TEST_F(BatchedIndexerAliasTest, StandaloneImportPersistsAndReleasesEachChunk) {
+    config.set_standalone(true);
+    config.set_data_dir(state_dir);
+    ReplicationState replication_state(server.get(), indexer.get(), store.get(), nullptr,
+                                       &thread_pool, false, &config, 1, 1);
+    replication_state.standalone_running = true;
+    auto req = make_req(200, 0, "products");
+    route_path* route = nullptr;
+    req->route_hash = server->find_route({"collections", "products", "documents", "import"},
+                                          "POST", &route);
+    ASSERT_NE(nullptr, route);
+    auto res = make_res();
+
+    req->body = R"({"id":"one"})";
+    req->last_chunk_aggregate = false;
+    replication_state.write(req, res);
+    EXPECT_TRUE(req->body.empty());
+    EXPECT_EQ(0, indexer->get_queued_writes());
+    EXPECT_EQ(1, indexer->req_res_map.at(200).num_chunks);
+
+    req->body = "\n" R"({"id":"two"})";
+    req->last_chunk_aggregate = true;
+    replication_state.write(req, res);
+    EXPECT_EQ(2, indexer->req_res_map.at(200).num_chunks);
+    EXPECT_EQ(2, indexer->get_queued_writes());
+    const size_t queue_id = StringUtils::hash_wy("products", 8) % 4;
+    ASSERT_EQ(1, indexer->queues[queue_id].size());
+    EXPECT_EQ(200, indexer->queues[queue_id].front());
+}
+
+TEST_F(BatchedIndexerAliasTest, StandaloneWriteFailsWhenItsRequestChunkCannotBePersisted) {
+    config.set_standalone(true);
+    const std::string failing_path = state_dir + "/failing-store";
+    std::filesystem::create_directory(failing_path);
+    // RocksDB rejects synchronous writes when the WAL is disabled.
+    Store failing_store(failing_path, 24*60*60, 1024, true, 0, 4*1048576, 2, 4*1048576, 5, true);
+    BatchedIndexer failing_indexer(server.get(), &failing_store, store.get(), 4, config, quit);
+    auto req = make_req(500, 500, "products");
+    req->body = R"({"id":"one"})";
+    req->last_chunk_aggregate = true;
+    route_path* route = nullptr;
+    req->route_hash = server->find_route({"collections", "products", "documents", "import"},
+                                          "POST", &route);
+    ASSERT_NE(nullptr, route);
+    auto res = make_res();
+
+    failing_indexer.enqueue(req, res);
+    EXPECT_EQ(500, res->status_code);
+    EXPECT_TRUE(failing_indexer.req_res_map.empty());
+    EXPECT_EQ(0, failing_indexer.get_queued_writes());
+}
 
 TEST_F(BatchedIndexerAliasTest, ResolvedAliasSchemaStillOrdersFailedSwapAfterChildCreation) {
     auto schema = nlohmann::json::parse(
