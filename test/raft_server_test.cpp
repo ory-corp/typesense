@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <future>
 #include <string>
+#include <limits>
 
 #define private public
 #include "raft_server.h"
@@ -147,6 +148,18 @@ namespace {
         ASSERT_EQ(0, writer->save_meta(meta));
         ASSERT_EQ(0, snapshot_storage.close(writer));
     }
+}
+
+TEST(RaftServerTest, JsonIntegerFormattingRoundTripsLargeValues) {
+    for(const int64_t value: {int64_t{17}, int64_t{1790182710717669LL},
+                              std::numeric_limits<int64_t>::min(),
+                              std::numeric_limits<int64_t>::max()}) {
+        const auto serialized = nlohmann::json(value).dump();
+        ASSERT_TRUE(nlohmann::json::accept(serialized));
+        EXPECT_EQ(value, nlohmann::json::parse(serialized).get<int64_t>());
+    }
+    const auto largest = std::numeric_limits<uint64_t>::max();
+    EXPECT_EQ(largest, nlohmann::json::parse(nlohmann::json(largest).dump()).get<uint64_t>());
 }
 
 TEST(RaftServerTest, SnapshotLoadGateBlocksReadinessAndCatchupRefresh) {
