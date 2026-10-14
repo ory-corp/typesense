@@ -44,6 +44,9 @@ jobs:
     # Skipped entirely in promote mode.
     if: ${{ inputs.version != '' }}
     strategy:
+      # A failure on one arch must not cancel the other mid-build: the
+      # survivor would lose a cold build that its cache save needs.
+      fail-fast: false
       matrix:
         include:
           - arch: amd64

@@ -82,6 +82,9 @@ jobs:
     # and the dispatch override could not rescue it.
     if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.ci-only != 'true') }}
     strategy:
+      # A failure on one arch must not cancel the other mid-build: the
+      # survivor would lose a cold build that its cache save needs.
+      fail-fast: false
       matrix:
         include:
           - arch: amd64

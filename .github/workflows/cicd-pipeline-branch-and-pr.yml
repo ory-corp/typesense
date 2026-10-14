@@ -73,6 +73,9 @@ jobs:
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       (github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.ci-only != 'true') }}
     strategy:
+      # A failure on one arch must not cancel the other mid-build: the
+      # survivor would lose a cold build that its cache save needs.
+      fail-fast: false
       matrix:
         include:
           - arch: amd64

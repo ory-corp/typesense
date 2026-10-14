@@ -36,8 +36,9 @@ inputs:
     required: false
     default: 'image-build'
     description: >-
-      Key for the Bazel disk/external caches. An input rather than a `vars`
-      lookup because `vars` availability inside composite actions is not
+      Name for the Bazel build cache (disk cache plus onnx_runtime sources);
+      changing it starts a fresh cache. An input rather than a `vars` lookup
+      because `vars` availability inside composite actions is not
       guaranteed; callers resolve it at workflow scope.
 
 outputs:
@@ -123,22 +124,75 @@ runs:
         sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++ 30
         sudo update-alternatives --set c++ /usr/bin/g++
 
-    - name: Set up Bazel
-      uses: bazel-contrib/setup-bazel@0.14.0
+    # Bazel's disk cache (action outputs, onnxruntime above all) is restored
+    # and saved here rather than by setup-bazel, which saves it even from a
+    # failed build, under a key that only changes with BUILD files. GitHub
+    # cache keys are immutable and an exact hit skips the save, so one
+    # half-finished build froze a cache without onnxruntime and every later
+    # build rebuilt it.
+    #
+    # Here the cache is saved only after a successful build and only when the
+    # key missed. The key hashes everything that shapes the dependency
+    # actions, so a dependency or flag change starts a new cache, seeded from
+    # the newest older one by prefix. The prefix carries the compiler: Bazel
+    # does not hash a local toolchain's binaries, so without it objects built
+    # by an older g++ would still count as hits.
+    #
+    # The onnx_runtime sources travel in the same entry. WORKSPACE moves its
+    # submodules to their remote HEADs on every fetch and the cmake rule takes
+    # the whole tree as input, so sources from a fresh fetch never match the
+    # cached onnxruntime build. Restoring both together keeps them in step.
+    - name: Compute Bazel cache key
+      id: bazel-cache-key
+      shell: bash
+      env:
+        CACHE_NAME: ${{ inputs.bazel_cache_key }}
+        ARCHITECTURE: ${{ inputs.architecture }}
+      run: |
+        compiler="$(g++ --version | sha256sum | cut -c1-12)"
+        build_inputs="$(find WORKSPACE .bazelrc .bazelversion bazel .github/actions/image-build -type f -print0 \
+          | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)"
+        prefix="bazel-${CACHE_NAME}-linux-${ARCHITECTURE}-${compiler}-"
+        {
+          echo "disk_cache=${HOME}/.cache/bazel-disk"
+          echo "output_base=${HOME}/.bazel"
+          echo "prefix=${prefix}"
+          echo "key=${prefix}${build_inputs}"
+        } >> "${GITHUB_OUTPUT}"
+        echo "Bazel cache key is ${prefix}${build_inputs}"
+
+    - name: Restore Bazel cache
+      id: bazel-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        # setup-bazel's cache keys include the OS but not the CPU arch, and
-        # GitHub cache keys are immutable: without this split the first arch to
-        # save would own the key and the other arch would stay cold forever.
-        cache-version: 1-${{ inputs.architecture }}
+        path: |
+          ${{ steps.bazel-cache-key.outputs.disk_cache }}
+          ${{ steps.bazel-cache-key.outputs.output_base }}/external/onnx_runtime
+          ${{ steps.bazel-cache-key.outputs.output_base }}/external/@onnx_runtime.marker
+        key: ${{ steps.bazel-cache-key.outputs.key }}
+        restore-keys: ${{ steps.bazel-cache-key.outputs.prefix }}
+
+    - name: Set up Bazel
+      uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+      with:
+        # Must match the paths cached above.
+        output-base: ${{ steps.bazel-cache-key.outputs.output_base }}
+        # These hold only downloads and fetched sources, so a partial save
+        # costs a refetch at worst. Their keys include the CPU arch.
+        # onnx_runtime is excluded: it is cached with the disk cache above.
         bazelisk-cache: true
-        disk-cache: ${{ inputs.bazel_cache_key }}
         repository-cache: true
-        external-cache: true
+        external-cache: |
+          manifest:
+            onnx_runtime: false
         # GCC 10.5's GCSE pass miscompiles nlohmann's dump_integer on aarch64,
         # corrupting integers in serialized JSON. Injected via the user-level
         # bazelrc (picked up by every bazel invocation in ci_build_v2.sh) so
-        # that script stays identical to upstream.
-        bazelrc: ${{ inputs.architecture == 'arm64' && 'build --copt=-fno-gcse' || '' }}
+        # that script stays identical to upstream. The disk cache flag goes in
+        # the same way.
+        bazelrc: |
+          build --disk_cache=${{ steps.bazel-cache-key.outputs.disk_cache }}
+          ${{ inputs.architecture == 'arm64' && 'build --copt=-fno-gcse' || '' }}
 
     # Stages the binary into dist/, which is the build context below.
     - name: Build Typesense server
@@ -148,6 +202,19 @@ runs:
         TYPESENSE_TARGET: typesense-server
         BAZEL_JOBS: ${{ inputs.bazel_jobs }}
       run: bash ci_build_v2.sh "--jobs=${BAZEL_JOBS}"
+
+    # Straight after the build, so a later registry or auth failure still
+    # keeps the cache. A pull request saves into its own scope, and only
+    # when the base branch had no exact match.
+    - name: Save Bazel cache
+      if: ${{ success() && steps.bazel-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ steps.bazel-cache-key.outputs.disk_cache }}
+          ${{ steps.bazel-cache-key.outputs.output_base }}/external/onnx_runtime
+          ${{ steps.bazel-cache-key.outputs.output_base }}/external/@onnx_runtime.marker
+        key: ${{ steps.bazel-cache-key.outputs.key }}
 
     # Must precede any image pull: the cache-* repos below are readable only
     # with this token, and only the writer pool carries that grant.
