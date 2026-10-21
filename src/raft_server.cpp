@@ -212,6 +212,20 @@ int ReplicationState::start_standalone(int api_port) {
     return 0;
 }
 
+void ReplicationState::set_standalone_stores(std::vector<Store*> stores) {
+    standalone_stores = std::move(stores);
+}
+
+bool ReplicationState::sync_standalone_stores() const {
+    return std::all_of(standalone_stores.begin(), standalone_stores.end(),
+                       [](Store* standalone_store) { return standalone_store->sync_wal().ok(); });
+}
+
+bool ReplicationState::has_standalone_wal_error() const {
+    return std::any_of(standalone_stores.begin(), standalone_stores.end(),
+                       [](Store* standalone_store) { return standalone_store->has_wal_sync_error(); });
+}
+
 std::string ReplicationState::get_standalone_url() const {
     std::string host = config->get_api_address();
     if(host.size() >= 2 && host.front() == '[' && host.back() == ']') {
@@ -453,6 +467,11 @@ void ReplicationState::write(const std::shared_ptr<http_req>& request, const std
                 auto req_res = new async_req_res_t(request, response, true);
                 return HttpServer::deliver_stream_response(req_res);
             }
+        }
+
+        if(!request->make_writes_durable) {
+            // One WAL sync per store covers all of the request's writes before its final response.
+            request->make_writes_durable = [this] { return sync_standalone_stores(); };
         }
 
         {
@@ -1139,8 +1158,8 @@ ReplicationState::ReplicationState(HttpServer* server, BatchedIndexer* batched_i
 }
 
 bool ReplicationState::is_alive() const {
-    // for general health check we will only care about the `read_caught_up` threshold
-    return read_caught_up;
+    // Read catch-up normally determines health; standalone also requires healthy WALs.
+    return read_caught_up && !(config->get_standalone() && has_standalone_wal_error());
 }
 
 uint64_t ReplicationState::node_state() const {

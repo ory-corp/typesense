@@ -139,6 +139,27 @@ Linux (x86_64 & arm64) and Mac (x86_64).
 
 <a href="https://cloud.typesense.org"><img src="assets/deploy_with_typesense_cloud.svg?raw=true" alt="Deploy with Typesense Cloud" height="60" /></a> 
 
+### Standalone durability
+
+`--standalone` runs a single node without Raft. Its RocksDB stores (documents, metadata
+and, with `--analytics-dir`, analytics events) keep write-ahead logs (WALs), which are
+synchronized to disk before each write request is acknowledged. One synchronization per
+changed store covers all writes of a request, however many documents it contains. A write
+is acknowledged when its response completes: an import streams results as it progresses,
+and they become durable before its final chunk is sent. Analytics events reach their store
+every `--analytics-flush-interval`; until then they are only in memory, as in Raft mode.
+
+Normal shutdown synchronizes the WALs after all writers stop. A failed synchronization is
+permanent for the process, because the OS may have discarded the unwritten data: the
+request waiting for it gets a 500 response, or its connection is closed before the
+response completes if part of it was already streamed; later writes fail; health checks
+fail; and the server shuts down with a nonzero exit status.
+
+Recovery loads persisted documents and discards unfinished request staging records;
+it does not replay those requests. Imports can therefore recover partially. Use a
+separate data directory for standalone mode; existing Raft directories require an
+explicit data migration.
+
 ## Quick Start
 
 Here's a quick example showcasing how you can create a collection, index a document and search it on Typesense.

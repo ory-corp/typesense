@@ -50,6 +50,30 @@ std::shared_ptr<http_res> make_res() {
     return std::make_shared<http_res>(nullptr);
 }
 
+// Fails every WAL sync, which puts a store into its sticky WAL error state.
+class FailingWalSyncEnv : public rocksdb::EnvWrapper {
+    class WalFile : public rocksdb::WritableFileWrapper {
+        std::unique_ptr<rocksdb::WritableFile> file;
+    public:
+        explicit WalFile(std::unique_ptr<rocksdb::WritableFile> file):
+            rocksdb::WritableFileWrapper(file.get()), file(std::move(file)) {}
+
+        rocksdb::Status Sync() override { return rocksdb::Status::IOError("injected WAL sync failure"); }
+        rocksdb::Status Fsync() override { return Sync(); }
+    };
+public:
+    FailingWalSyncEnv(): rocksdb::EnvWrapper(rocksdb::Env::Default()) {}
+
+    rocksdb::Status NewWritableFile(const std::string& name, std::unique_ptr<rocksdb::WritableFile>* result,
+                                    const rocksdb::EnvOptions& options) override {
+        auto status = target()->NewWritableFile(name, result, options);
+        if(status.ok() && name.size() >= 4 && name.compare(name.size() - 4, 4, ".log") == 0) {
+            *result = std::make_unique<WalFile>(std::move(*result));
+        }
+        return status;
+    }
+};
+
 }  // namespace
 
 class BatchedIndexerAliasTest : public ::testing::Test {
@@ -325,12 +349,14 @@ TEST_F(BatchedIndexerAliasTest, StandaloneImportPersistsAndReleasesEachChunk) {
     EXPECT_EQ(200, indexer->queues[queue_id].front());
 }
 
-TEST_F(BatchedIndexerAliasTest, StandaloneWriteFailsWhenItsRequestChunkCannotBePersisted) {
+TEST_F(BatchedIndexerAliasTest, StandaloneWriteIsRejectedAfterAWalSyncFailure) {
     config.set_standalone(true);
     const std::string failing_path = state_dir + "/failing-store";
     std::filesystem::create_directory(failing_path);
-    // RocksDB rejects synchronous writes when the WAL is disabled.
-    Store failing_store(failing_path, 24*60*60, 1024, true, 0, 4*1048576, 2, 4*1048576, 5, true);
+    FailingWalSyncEnv env;
+    Store failing_store(failing_path, 0, 0, false, 0, 4*1048576, 2, 4*1048576, 5, &env);
+    ASSERT_TRUE(failing_store.insert("unsynced", "value"));
+    ASSERT_FALSE(failing_store.sync_wal().ok());
     BatchedIndexer failing_indexer(server.get(), &failing_store, store.get(), 4, config, quit);
     auto req = make_req(500, 500, "products");
     req->body = R"({"id":"one"})";
@@ -342,9 +368,140 @@ TEST_F(BatchedIndexerAliasTest, StandaloneWriteFailsWhenItsRequestChunkCannotBeP
     auto res = make_res();
 
     failing_indexer.enqueue(req, res);
-    EXPECT_EQ(500, res->status_code);
+    EXPECT_EQ(503, res->status_code);
     EXPECT_TRUE(failing_indexer.req_res_map.empty());
     EXPECT_EQ(0, failing_indexer.get_queued_writes());
+}
+
+TEST_F(BatchedIndexerAliasTest, StandaloneWritesSyncEveryStoreWal) {
+    config.set_standalone(true);
+    config.set_data_dir(state_dir);
+    const std::string primary_path = state_dir + "/primary-store";
+    const std::string meta_path = state_dir + "/meta-store";
+    std::filesystem::create_directory(primary_path);
+    std::filesystem::create_directory(meta_path);
+    FailingWalSyncEnv env;
+    Store primary_store(primary_path, 0, 0, false);
+    Store meta_store(meta_path, 0, 0, false, 0, 4*1048576, 2, 4*1048576, 5, &env);
+    ASSERT_TRUE(primary_store.insert("unsynced", "value"));
+    ASSERT_TRUE(meta_store.insert("unsynced", "value"));
+    ReplicationState replication_state(server.get(), indexer.get(), &primary_store, nullptr,
+                                       &thread_pool, false, &config, 1, 1);
+    replication_state.set_standalone_stores({&primary_store, &meta_store});
+    replication_state.standalone_running = true;
+    replication_state.read_caught_up = true;
+    auto req = make_req(101, 0, "");
+    req->body = R"({"name":"products","fields":[]})";
+    req->last_chunk_aggregate = true;
+    route_path* route = nullptr;
+    req->route_hash = server->find_route({"collections"}, "POST", &route);
+    ASSERT_NE(nullptr, route);
+
+    replication_state.write(req, make_res());
+    ASSERT_TRUE(req->make_writes_durable);
+    EXPECT_TRUE(replication_state.is_alive());
+    // The hook syncs every store, not just the primary one. A failure in any of them fails the
+    // request and the health check.
+    EXPECT_FALSE(req->make_writes_durable());
+    EXPECT_FALSE(primary_store.has_wal_sync_error());
+    EXPECT_TRUE(meta_store.has_wal_sync_error());
+    EXPECT_FALSE(replication_state.is_alive());
+}
+
+TEST_F(BatchedIndexerAliasTest, StandaloneResponsesWaitForDurableWrites) {
+    config.set_standalone(true);
+    config.set_data_dir(state_dir);
+    auto schema = nlohmann::json::parse(R"({"name":"products","fields":[{"name":"title","type":"string"}]})");
+    ASSERT_TRUE(cm.create_collection(schema).ok());
+    ReplicationState replication_state(server.get(), indexer.get(), store.get(), nullptr,
+                                       &thread_pool, false, &config, 1, 1);
+    replication_state.standalone_running = true;
+    std::thread runner([&] { indexer->run(); });
+
+    std::atomic<size_t> durability_checks{0};
+    auto write = [&](const uint64_t id, const std::vector<std::string>& path, const std::string& body,
+                     const bool durable) {
+        auto req = make_req(id, 0, path.size() > 1 ? path[1] : "");
+        req->body = body;
+        req->last_chunk_aggregate = true;
+        req->make_writes_durable = [&durability_checks, durable] {
+            ++durability_checks;
+            return durable;
+        };
+        route_path* route = nullptr;
+        req->route_hash = server->find_route(path, "POST", &route);
+        EXPECT_NE(nullptr, route);
+        // A live client without an owning event loop: the response stays readable in place.
+        auto res = make_res();
+        res->is_alive = true;
+        res->notify();
+        replication_state.write(req, res);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while(indexer->get_queued_writes() != 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        EXPECT_EQ(0, indexer->get_queued_writes());
+        return res;
+    };
+
+    // A handler that responds once, through the indexer.
+    auto created = write(10, {"collections"}, R"({"name":"orders","fields":[{"name":"title","type":"string"}]})",
+                         true);
+    EXPECT_EQ(201, created->status_code) << created->body;
+    EXPECT_EQ(1, durability_checks);
+
+    // A streaming handler (import) that responds itself.
+    auto imported = write(11, {"collections", "products", "documents", "import"},
+                          R"({"id":"one","title":"first"})", false);
+    EXPECT_EQ(500, imported->status_code);
+    EXPECT_NE(std::string::npos, imported->body.find("WAL synchronization failed.")) << imported->body;
+    EXPECT_EQ(2, durability_checks);
+    // The document was written, but the response does not acknowledge it.
+    EXPECT_EQ(1, cm.get_collection("products")->get_num_documents());
+
+    indexer->stop();
+    runner.join();
+}
+
+TEST(StandaloneDurableWritesTest, FinalResponsesWaitForDurableWrites) {
+    auto req = std::make_shared<http_req>();
+    auto res = std::make_shared<http_res>(nullptr);
+    res->is_alive = true;
+    res->set_201("{}");
+    // Without a hook (Raft mode, reads), responses are unaffected.
+    EXPECT_TRUE(HttpServer::await_durable_writes(req, res));
+
+    size_t checks = 0;
+    bool durable = true;
+    req->make_writes_durable = [&] {
+        ++checks;
+        return durable;
+    };
+    res->final = false;
+    EXPECT_TRUE(HttpServer::await_durable_writes(req, res));
+    EXPECT_EQ(0, checks);
+
+    res->final = true;
+    EXPECT_TRUE(HttpServer::await_durable_writes(req, res));
+    EXPECT_EQ(1, checks);
+    EXPECT_EQ(201, res->status_code);
+
+    // A client that has gone away is not waiting for an acknowledgement.
+    res->is_alive = false;
+    EXPECT_TRUE(HttpServer::await_durable_writes(req, res));
+    EXPECT_EQ(1, checks);
+    res->is_alive = true;
+
+    durable = false;
+    EXPECT_TRUE(HttpServer::await_durable_writes(req, res));
+    EXPECT_EQ(500, res->status_code);
+
+    // Once an earlier chunk was captured, the status is fixed: break the stream instead.
+    req->res_state.is_res_start = false;
+    res->set_200("{\"success\":true}");
+    EXPECT_FALSE(HttpServer::await_durable_writes(req, res));
+    EXPECT_EQ(H2O_SEND_STATE_ERROR, req->res_state.send_state);
+    EXPECT_TRUE(res->body.empty());
 }
 
 TEST_F(BatchedIndexerAliasTest, ResolvedAliasSchemaStillOrdersFailedSwapAfterChildCreation) {

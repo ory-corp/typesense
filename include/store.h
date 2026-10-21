@@ -7,9 +7,13 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <atomic>
+#include <functional>
+#include <optional>
 #include <shared_mutex>
 #include <option.h>
 #include <rocksdb/db.h>
+#include <rocksdb/env.h>
 #include <rocksdb/write_batch.h>
 #include <rocksdb/options.h>
 #include <rocksdb/merge_operator.h>
@@ -59,6 +63,13 @@ private:
     rocksdb::Options options;
     rocksdb::WriteOptions write_options;
 
+    // Serializes sync_wal(), so that no sync reports success after a concurrent one failed.
+    std::mutex wal_sync_mutex;
+    std::atomic<bool> wal_sync_failed{false};
+    std::function<void()> wal_sync_error_handler;
+    // The latest sequence number when the last successful sync_wal() started.
+    std::optional<rocksdb::SequenceNumber> wal_synced_seq;
+
     // Used to protect assignment to DB handle, which is otherwise thread safe
     // So we use unique lock only for assignment, but shared locks for all other operations on DB
     mutable std::shared_mutex mutex;
@@ -78,9 +89,15 @@ public:
           size_t max_write_buffer_number = 2,
           size_t max_log_file_size = 4*1048576,
           size_t keep_log_file_num = 5,
-          bool sync_writes = false);
+          rocksdb::Env* env = rocksdb::Env::Default());
 
-    bool syncs_writes() const { return write_options.sync; }
+    // Requires an open store with the WAL enabled. Skips the disk when nothing was written since the
+    // last successful sync. A failed sync is sticky: the OS may have dropped the unwritten data, so
+    // later syncs and all mutations fail. The handler, set before the first sync, runs once on the
+    // thread whose sync failed.
+    rocksdb::Status sync_wal();
+    bool has_wal_sync_error() const { return wal_sync_failed.load(); }
+    void set_wal_sync_error_handler(std::function<void()> handler);
 
     ~Store();
 

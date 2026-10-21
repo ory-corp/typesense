@@ -303,7 +303,7 @@ TEST(RaftServerTest, ClearsOnlyAbandonedStandaloneRequestChunksOnStartup) {
     char path[] = "/tmp/typesense-standalone-chunks-XXXXXX";
     ASSERT_NE(nullptr, mkdtemp(path));
     {
-        Store store(path, 24*60*60, 1024, false, 0, 4*1048576, 2, 4*1048576, 5, true);
+        Store store(path, 0, 0, false);
         ASSERT_TRUE(store.insert("$RL_orphan", "chunk"));
         ASSERT_TRUE(store.insert("collection", "preserve"));
         auto& config = Config::get_instance();

@@ -2,7 +2,9 @@
 
 Store::Store(const std::string & state_dir_path, const size_t wal_ttl_secs, const size_t wal_size_mb, bool disable_wal,
              int32_t ttl, size_t write_buffer_size,size_t max_write_buffer_number, size_t max_log_file_size,
-             size_t keep_log_file_num, bool sync_writes): state_dir_path(state_dir_path) {
+             size_t keep_log_file_num, rocksdb::Env* env): state_dir_path(state_dir_path) {
+    // IncreaseParallelism() configures the env's thread pools, so set the env first
+    options.env = env;
     // Optimize RocksDB
     options.IncreaseParallelism();
     options.OptimizeLevelStyleCompaction();
@@ -26,7 +28,6 @@ Store::Store(const std::string & state_dir_path, const size_t wal_ttl_secs, cons
     // Disable WAL for master writes (Raft's WAL is used)
     // The replica uses native WAL, though.
     write_options.disableWAL = disable_wal;
-    write_options.sync = sync_writes;
 
     // open DB
     init_db(ttl);
@@ -36,8 +37,41 @@ Store::~Store() {
     close();
 }
 
+rocksdb::Status Store::sync_wal() {
+    std::lock_guard sync_lock(wal_sync_mutex);
+    std::shared_lock lock(mutex);
+    if(!db || write_options.disableWAL) {
+        return rocksdb::Status::InvalidArgument("WAL sync requires an open store with WAL enabled.");
+    }
+    if(wal_sync_failed) {
+        return rocksdb::Status::IOError("A previous WAL sync failed.");
+    }
+    // A write is in the WAL before its sequence number is published, so a sync that starts after
+    // reading the latest number covers every write up to it.
+    const auto latest_seq = db->GetLatestSequenceNumber();
+    if(wal_synced_seq == latest_seq) {
+        return rocksdb::Status::OK();
+    }
+    const auto status = db->SyncWAL();
+    if(status.ok()) {
+        wal_synced_seq = latest_seq;
+    } else {
+        wal_sync_failed = true;
+        LOG(ERROR) << "Failed to synchronize RocksDB WAL: " << status.ToString();
+        if(wal_sync_error_handler) {
+            wal_sync_error_handler();
+        }
+    }
+    return status;
+}
+
+void Store::set_wal_sync_error_handler(std::function<void()> handler) {
+    wal_sync_error_handler = std::move(handler);
+}
+
 rocksdb::Status Store::init_db(int32_t ttl) {
     LOG(INFO) << "Initializing DB by opening state dir: " << state_dir_path;
+    wal_synced_seq.reset();
 
     rocksdb::Status s;
 
@@ -65,12 +99,14 @@ rocksdb::Status Store::init_db(int32_t ttl) {
 }
 
 bool Store::insert(const std::string& key, const std::string& value) {
+    if(wal_sync_failed) return false;
     std::shared_lock lock(mutex);
     rocksdb::Status status = db->Put(write_options, key, value);
     return status.ok();
 }
 
 bool Store::batch_write(rocksdb::WriteBatch& batch) {
+    if(wal_sync_failed) return false;
     std::shared_lock lock(mutex);
     rocksdb::Status status = db->Write(write_options, &batch);
     return status.ok();
@@ -114,6 +150,7 @@ StoreStatus Store::get(const std::string& key, std::string& value) const {
 }
 
 bool Store::remove(const std::string& key) {
+    if(wal_sync_failed) return false;
     std::shared_lock lock(mutex);
     rocksdb::Status status = db->Delete(write_options, key);
     return status.ok();
@@ -151,6 +188,7 @@ void Store::scan_fill(const std::string& prefix_start, const std::string& prefix
 }
 
 void Store::increment(const std::string & key, uint32_t value) {
+    if(wal_sync_failed) return;
     std::shared_lock lock(mutex);
     db->Merge(write_options, key, StringUtils::serialize_uint32_t(value));
 }
@@ -302,6 +340,7 @@ rocksdb::Status Store::create_check_point(rocksdb::Checkpoint** checkpoint_ptr, 
 }
 
 rocksdb::Status Store::delete_range(const std::string& begin_key, const std::string& end_key) {
+    if(wal_sync_failed) return rocksdb::Status::IOError("A previous WAL sync failed.");
     std::shared_lock lock(mutex);
     return db->DeleteRange(write_options, db->DefaultColumnFamily(), begin_key, end_key);
 }

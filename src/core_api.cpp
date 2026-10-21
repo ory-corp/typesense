@@ -173,6 +173,10 @@ void stream_response(const std::shared_ptr<http_req>& req, const std::shared_ptr
     // wait for previous chunk to finish (if any)
     res->wait();
 
+    if(!HttpServer::await_durable_writes(req, res)) {
+        return ;
+    }
+
     auto req_res = new async_req_res_t(req, res, true);
     HttpServer::deliver_stream_response(req_res);
 }

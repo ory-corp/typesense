@@ -328,6 +328,10 @@ struct http_req {
 
     std::atomic<bool> is_write = false;
 
+    // Standalone mode: makes the request's writes durable, returning false on failure.
+    // HttpServer::await_durable_writes() calls it before the final response acknowledges them.
+    std::function<bool()> make_writes_durable;
+
     bool (*async_res_set_headers_callback)(const std::string&, const std::shared_ptr<http_req>, long, std::string&) = nullptr;
     void (*async_res_write_callback)(std::string&, const std::shared_ptr<http_req>&, const std::shared_ptr<http_res>&) = nullptr;
     bool (*async_res_done_callback)(const std::shared_ptr<http_req>&, const std::shared_ptr<http_res>&) = nullptr;

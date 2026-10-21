@@ -97,7 +97,11 @@ void BatchedIndexer::enqueue(const std::shared_ptr<http_req>& req, const std::sh
             req_res_map.erase(req->start_ts);
         }
         store->delete_range(req_key_prefix, get_req_suffix_key(req->start_ts));
-        res->set_500("Failed to persist write request.");
+        if(store->has_wal_sync_error()) {
+            res->set_503("WAL synchronization failed.");
+        } else {
+            res->set_500("Failed to persist write request.");
+        }
         res->final = true;
         auto req_res = new async_req_res_t(req, res, true);
         HttpServer::deliver_stream_response(req_res);
@@ -317,8 +321,11 @@ void BatchedIndexer::run() {
                             LOG(ERROR) << err_msg;
                             orig_res->set_422(err_msg);
                             orig_res->final = true;
-                            async_req_res_t* async_req_res = new async_req_res_t(orig_req, orig_res, true);
-                            HttpServer::deliver_stream_response(async_req_res);
+                            // earlier chunks of this request may have written documents
+                            if(HttpServer::await_durable_writes(orig_req, orig_res)) {
+                                async_req_res_t* async_req_res = new async_req_res_t(orig_req, orig_res, true);
+                                HttpServer::deliver_stream_response(async_req_res);
+                            }
                             goto end;
                         }
 
@@ -326,8 +333,10 @@ void BatchedIndexer::run() {
                             if(skip_writes && found_rpath->handler != post_config) {
                                 orig_res->set(422, "Skipping write.");
                                 orig_res->final = true;
-                                async_req_res_t* async_req_res = new async_req_res_t(orig_req, orig_res, true);
-                                HttpServer::deliver_stream_response(async_req_res);
+                                if(HttpServer::await_durable_writes(orig_req, orig_res)) {
+                                    async_req_res_t* async_req_res = new async_req_res_t(orig_req, orig_res, true);
+                                    HttpServer::deliver_stream_response(async_req_res);
+                                }
                                 goto end;
                             }
 
@@ -353,7 +362,8 @@ void BatchedIndexer::run() {
                             orig_res->set_404();
                         }
 
-                        if(is_live_req && (!route_found ||!async_res)) {
+                        if(is_live_req && (!route_found ||!async_res) &&
+                           HttpServer::await_durable_writes(orig_req, orig_res)) {
                             // sync request gets a response immediately
                             async_req_res_t* async_req_res = new async_req_res_t(orig_req, orig_res, true);
                             HttpServer::deliver_stream_response(async_req_res);

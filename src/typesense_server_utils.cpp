@@ -661,14 +661,18 @@ int run_server(const Config & config, const std::string & version, void (*master
     // Primary DB used for storing the documents. The store WAL is what makes a write survive a
     // process restart, so its setting depends on where durability comes from:
     //   - Raft (default): Raft's replicated log is the WAL, so the store WAL is disabled.
-    //   - --standalone: there is no Raft log, so the store uses a synchronous RocksDB WAL.
-    //     CollectionManager::load() rebuilds the in-memory index from recovered writes.
+    //   - --standalone: use the RocksDB WAL, synced before each write request is acknowledged.
+    //     CollectionManager::load() rebuilds the in-memory index from recovered writes. Nothing
+    //     reads archived WAL files (Store::get_updates_since), so obsolete ones are deleted
+    //     instead of archived, in every store.
     const bool disable_db_wal = !config.get_standalone();
-    Store store(db_dir, 24*60*60, 1024, disable_db_wal, 0, db_write_buffer_size, db_max_write_buffer_number,
-                db_max_log_file_size, db_keep_log_file_num, config.get_standalone());
+    const size_t wal_ttl_secs = config.get_standalone() ? 0 : 24*60*60;
+    const size_t wal_size_mb = config.get_standalone() ? 0 : 1024;
+    Store store(db_dir, wal_ttl_secs, wal_size_mb, disable_db_wal, 0, db_write_buffer_size,
+                db_max_write_buffer_number, db_max_log_file_size, db_keep_log_file_num);
 
     // meta DB for storing house keeping things
-    Store meta_store(meta_dir, 24*60*60, 1024, false);
+    Store meta_store(meta_dir, wal_ttl_secs, wal_size_mb, false);
 
     Store* analytics_store = nullptr;
     if(!analytics_dir.empty()) {
@@ -687,7 +691,34 @@ int run_server(const Config & config, const std::string & version, void (*master
             }
         }
 
-        analytics_store = new Store(analytics_db_dir, 24*60*60, 1024, true, analytics_db_ttl);
+        // Raft snapshots flush this store before copying it. Standalone mode has none, so it
+        // uses the WAL instead.
+        analytics_store = new Store(analytics_db_dir, wal_ttl_secs, wal_size_mb, disable_db_wal,
+                                    analytics_db_ttl);
+    }
+
+    // --standalone: every store a write request can change, synced before its final response.
+    std::vector<Store*> standalone_stores;
+    if(config.get_standalone()) {
+        standalone_stores = {&store, &meta_store};
+        if(analytics_store != nullptr) {
+            standalone_stores.push_back(analytics_store);
+        }
+
+        for(Store* standalone_store : standalone_stores) {
+            standalone_store->set_wal_sync_error_handler([] {
+                LOG(ERROR) << "Stopping standalone server after a WAL sync failure.";
+                quit_raft_service = true;
+            });
+
+            // Surface storage errors before accepting requests.
+            const auto status = standalone_store->sync_wal();
+            if(!status.ok()) {
+                LOG(ERROR) << "Could not synchronize the standalone WAL: " << status.ToString();
+                delete analytics_store;
+                return 1;
+            }
+        }
     }
 
     AnalyticsManager::get_instance().init(&store, analytics_store, analytics_minute_rate_limit);
@@ -760,6 +791,7 @@ int run_server(const Config & config, const std::string & version, void (*master
                                        &config,
                                        num_collections_parallel_load,
                                        config.get_num_documents_parallel_load());
+    replication_state.set_standalone_stores(standalone_stores);
 
     auto conversations_init = ConversationManager::get_instance().init(&replication_state);
 
@@ -870,6 +902,16 @@ int run_server(const Config & config, const std::string & version, void (*master
     synonymIndexManager.dispose();
 
     CurationIndexManager.dispose();
+
+    // All request and background writers have stopped. This final sync covers writes that no
+    // request waited for (e.g. TTL expiry, rate limit bans). Do this before
+    // CollectionManager::dispose(), which closes the primary store.
+    for(Store* standalone_store : standalone_stores) {
+        if(!standalone_store->sync_wal().ok()) {
+            LOG(ERROR) << "Standalone WAL synchronization failed; exiting with an error.";
+            ret_code = 1;
+        }
+    }
 
     CollectionManager::get_instance().dispose();
 

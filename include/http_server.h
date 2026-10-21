@@ -286,6 +286,13 @@ public:
 
     static void deliver_defer_processing(defer_processing_t* defer);
 
+    // Call before capturing a chunk of a write's response for delivery: a final chunk first waits
+    // for req->make_writes_durable(). If that fails, the response becomes a 500 when nothing has been
+    // sent yet. Otherwise this ends the response with an error and returns false, and the caller
+    // must not send the chunk: the client never receives a complete response for writes that are
+    // not durable.
+    static bool await_durable_writes(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
     static void stream_response(stream_response_state_t& state);
 
     uint64_t find_route(const std::vector<std::string> & path_parts, const std::string & http_method,

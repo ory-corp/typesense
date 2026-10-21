@@ -1091,7 +1091,8 @@ void HttpServer::stream_response(stream_response_state_t& state) {
         }
 
         if(is_http_v1) {
-            h2o_send(req, &state.res_buff, 1, H2O_SEND_STATE_FINAL);
+            // FINAL, or ERROR for a response whose writes are not durable (see await_durable_writes)
+            h2o_send(req, &state.res_buff, 1, state.send_state);
             h2o_dispose_request(req);
         } else {
             h2o_send(req, &state.res_buff, 1, H2O_SEND_STATE_ERROR);
@@ -1106,7 +1107,7 @@ void HttpServer::stream_response(stream_response_state_t& state) {
         h2o_start_response(req, state.generator);
     }
 
-    if(state.res_buff.len == 0 && state.send_state != H2O_SEND_STATE_FINAL) {
+    if(state.res_buff.len == 0 && state.send_state == H2O_SEND_STATE_IN_PROGRESS) {
         // without this guard, http streaming will break
         state.generator->proceed(state.generator, req);
         return;
@@ -1302,6 +1303,26 @@ void HttpServer::deliver_defer_processing(defer_processing_t* defer) {
     defer->req->notify();
     defer->res->notify();
     delete defer;
+}
+
+bool HttpServer::await_durable_writes(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    if(!res->final || !res->is_alive || !req->make_writes_durable || req->make_writes_durable()) {
+        return true;
+    }
+
+    // The status can still change unless an earlier chunk has already been captured for sending.
+    if(req->res_state.is_res_start) {
+        res->content_type_header = "application/json; charset=utf-8";
+        res->set_500("WAL synchronization failed.");
+        return true;
+    }
+
+    // Break the stream instead, so the client sees an incomplete response rather than waiting.
+    res->body.clear();
+    auto req_res = new async_req_res_t(req, res, true);
+    req_res->get_res_state().send_state = H2O_SEND_STATE_ERROR;
+    deliver_stream_response(req_res);
+    return false;
 }
 
 bool HttpServer::on_stream_response_message(void *data) {

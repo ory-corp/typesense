@@ -167,6 +167,12 @@ private:
     // --standalone only: the URL of this node's own API, for requests meant for the leader.
     std::string get_standalone_url() const;
 
+    // --standalone only: the stores whose WALs make a write request's changes durable.
+    std::vector<Store*> standalone_stores;
+
+    bool sync_standalone_stores() const;
+    bool has_standalone_wal_error() const;
+
 public:
 
     static constexpr const char* log_dir_name = "log";
@@ -187,6 +193,10 @@ public:
     // Starts the state machine in --standalone mode (no Raft): loads collections from the
     // durable store and marks the node ready/leader. Writes are applied directly (see write()).
     int start_standalone(int api_port);
+
+    // --standalone only: every store a write request can change. Each request syncs their WALs
+    // before its final response, and a failed sync fails the health check.
+    void set_standalone_stores(std::vector<Store*> stores);
 
     // Generic write method for synchronizing all writes
     void write(const std::shared_ptr<http_req>& request, const std::shared_ptr<http_res>& response);
