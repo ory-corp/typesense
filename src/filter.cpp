@@ -880,6 +880,11 @@ Option<bool> toParseTree(std::queue<std::string>& postfix, filter_node_t*& root,
         nodeStack.push(filter_node);
     }
 
+    if (is_successful && nodeStack.size() > 1) {
+        is_successful = false;
+        error_message = "Could not parse the filter query: missing `&&` or `||` between expressions.";
+    }
+
     if (!is_successful) {
         while (!nodeStack.empty()) {
             auto filterNode = nodeStack.top();

@@ -2717,6 +2717,68 @@ TEST_F(CollectionFilteringTest, ComplexFilterQuery) {
     collectionManager.drop_collection("ComplexFilterQueryCollection");
 }
 
+TEST_F(CollectionFilteringTest, FilterExpressionsWithoutOperator) {
+    nlohmann::json schema =
+            R"({
+                "name": "products",
+                "fields": [
+                    {"name": "name", "type": "string"},
+                    {"name": "category", "type": "string"},
+                    {"name": "in_stock", "type": "bool"}
+                ]
+            })"_json;
+
+    auto coll = collectionManager.create_collection(schema).get();
+
+    std::vector<std::string> products = {
+            R"({"id": "0", "name": "Trail runner", "category": "shoes", "in_stock": true})",
+            R"({"id": "1", "name": "Leather boot", "category": "shoes", "in_stock": false})",
+            R"({"id": "2", "name": "Rain jacket", "category": "jackets", "in_stock": true})",
+            R"({"id": "3", "name": "Wool sock", "category": "socks", "in_stock": false})",
+    };
+
+    for (const auto& product: products) {
+        ASSERT_TRUE(coll->add(product).ok());
+    }
+
+    for (const auto& filter_by: {"in_stock:true (category:=shoes)",
+                                 "(in_stock:true) (category:=shoes)",
+                                 "(in_stock:true) category:=shoes"}) {
+        auto search_op = coll->search("*", {}, filter_by, {}, {}, {0});
+        ASSERT_FALSE(search_op.ok()) << filter_by;
+        ASSERT_EQ(400, search_op.code()) << filter_by;
+        ASSERT_EQ("Could not parse the filter query: missing `&&` or `||` between expressions.",
+                  search_op.error()) << filter_by;
+    }
+
+    auto search_op = coll->search("*", {}, "(|| in_stock:true) category:=shoes", {}, {}, {0});
+    ASSERT_FALSE(search_op.ok());
+    ASSERT_EQ(400, search_op.code());
+    ASSERT_EQ("Could not parse the filter query: unbalanced `||` operands.", search_op.error());
+
+    std::vector<std::pair<std::string, std::set<std::string>>> valid_filters = {
+            {"in_stock:true && (category:=shoes)", {"0"}},
+            {"(in_stock:true) && (category:=shoes)", {"0"}},
+            {"(category:=shoes) || category:=socks", {"0", "1", "3"}},
+            {"(in_stock:true || category:=socks) && (category:=shoes || category:=socks)", {"0", "3"}},
+            {"category:=shoes && (in_stock:false || (category:=jackets))", {"1"}},
+    };
+
+    for (const auto& [filter_by, expected_ids]: valid_filters) {
+        search_op = coll->search("*", {}, filter_by, {}, {}, {0});
+        ASSERT_TRUE(search_op.ok()) << filter_by;
+
+        auto results = search_op.get();
+        std::set<std::string> ids;
+        for (const auto& hit: results["hits"]) {
+            ids.insert(hit["document"]["id"].get<std::string>());
+        }
+        ASSERT_EQ(expected_ids, ids) << filter_by;
+    }
+
+    collectionManager.drop_collection("products");
+}
+
 TEST_F(CollectionFilteringTest, PrefixSearchWithFilter) {
     std::ifstream infile(std::string(ROOT_DIR)+"test/documents.jsonl");
     std::vector<field> search_fields = {
